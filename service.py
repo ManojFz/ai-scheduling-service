@@ -1,4 +1,5 @@
 import re
+import time
 from fastapi import  WebSocketDisconnect
 import websockets
 import os
@@ -13,7 +14,6 @@ import audioop
 import numpy as np
 from pyrnnoise import RNNoise
 from scipy import signal
-import numpy as np
 from langchain_openai import AzureChatOpenAI
 from langchain_core.prompts import PromptTemplate
 from dotenv import load_dotenv
@@ -28,9 +28,9 @@ logger = logging.getLogger(__name__)
 
 # --- Configuration ---
 class Config:
-    CHUNK_INTERVAL_MS = 200  # 20ms for smoother audio
-    CHUNK_BYTES = 3200     # 200ms of 8kHz 16-bit PCM = 3200 bytes
-  
+    CHUNK_INTERVAL_MS = 100  # 100ms pacing for outbound audio
+    CHUNK_BYTES = 1600     # 100ms of 8kHz 16-bit PCM = 1600 bytes
+
 
 # --- Credentials ---
 VOICE = "shimmer"
@@ -41,6 +41,10 @@ EXOTEL_SUBDOMAIN = os.getenv("EXOTEL_SUBDOMAIN")
 EXOTEL_FLOW_APP_ID = os.getenv("EXOTEL_FLOW_APP_ID")
 EXOTEL_CALLER_ID = os.getenv("EXOTEL_CALLER_ID")
 
+# Inbound RNNoise: default off; set ENABLE_INBOUND_RNNOISE=1 to enable.
+ENABLE_INBOUND_RNNOISE = os.getenv("ENABLE_INBOUND_RNNOISE", "0").lower() in ("1", "true", "yes")
+if ENABLE_INBOUND_RNNOISE:
+    logger.info("ENABLE_INBOUND_RNNOISE is enabled — inbound audio uses RNNoise")
 
 
 # Azure OpenAI configuration
@@ -92,8 +96,11 @@ ai_transcripts: Dict[str, str] = {}
 outbound_audio_buffers: Dict[str, bytearray] = {}
 sender_tasks: Dict[str, asyncio.Task] = {}
 call_context: Dict[str, Dict[str, Any]] = {}
-
-
+cleanup_locks: Dict[str, asyncio.Lock] = {}
+silence_timer_tasks: Dict[str, asyncio.Task] = {}
+response_audio_tracking: Dict[str, Dict[str, Any]] = {}
+SILENCE_TIMEOUT_SECONDS = 6.0
+ULAW_BYTES_PER_SECOND = 8000
 
 
 ###################################### 2025 -09 -10 evening prompt ###############################################
@@ -130,7 +137,7 @@ Available dates and slots for the customer: {{available_dates}}
 
 MANDATORY CONVERSATION FLOW
 Step 0 (LANGUAGE SELECTION)
-👉 “Hello! I'm calling from HP Service to schedule your appointment. For quality assurance, this call is being recorded. To better assist you, please select your preferred language: English,  Hindi, Telugu, Tamil, or Kannada.”
+👉 “Hello! I'm calling from DELL Service to schedule your appointment. To better assist you, please select your preferred language: English,  Hindi, Telugu, Tamil, or Kannada.”
 If unclear/noise/invalid → repeat request.
 Once detected → MUST confirm **in that detected language**:
 👉 “You selected [Language]. Is that correct?”
@@ -219,10 +226,49 @@ def convert_ulaw_to_pcm(ulaw_data: bytes) -> bytes:
         return b''
 
 
+class RNNoiseProcessor:
+    def __init__(self):
+        self.denoiser = RNNoise(sample_rate=48000)
+        self.telephony_rate = 8000
+        self.rnnoise_rate = 48000
+        self.frame_size_8k = 80
+        self.frame_size_48k = 480
+
+    def apply_noise_suppression(self, pcm_bytes: bytes) -> bytes:
+        try:
+            audio_8k = np.frombuffer(pcm_bytes, dtype=np.int16)
+            audio_48k = signal.resample_poly(audio_8k, 6, 1)
+            audio_48k = audio_48k.astype(np.int16)
+            num_samples = len(audio_48k)
+            if num_samples < self.frame_size_48k:
+                audio_48k = np.pad(audio_48k, (0, self.frame_size_48k - num_samples))
+            audio_48k_reshaped = audio_48k.reshape(1, -1)
+            denoised_frames = []
+            for speech_prob, denoised_frame in self.denoiser.denoise_chunk(audio_48k_reshaped):
+                denoised_frames.append(denoised_frame)
+            if denoised_frames:
+                denoised_48k = np.concatenate(denoised_frames, axis=1).flatten()
+            else:
+                denoised_48k = audio_48k
+            denoised_8k = signal.resample_poly(denoised_48k, 1, 6)
+            denoised_8k = denoised_8k.astype(np.int16)
+            denoised_8k = denoised_8k[:len(audio_8k)]
+            return denoised_8k.tobytes()
+        except Exception as e:
+            logger.error(f"Error during RNNoise suppression: {e}")
+            return pcm_bytes
+
+
+rnnoise_processor = RNNoiseProcessor()
+
+
+def process_audio_chunk(pcm_bytes: bytes) -> bytes:
+    return rnnoise_processor.apply_noise_suppression(pcm_bytes)
+
 
 async def paced_audio_sender(stream_sid: str):
     logger.info(f"✅ Starting Optimized Audio Sender for stream {stream_sid}")
-    prebuffer_threshold = Config.CHUNK_BYTES * 3
+    prebuffer_threshold = Config.CHUNK_BYTES * 2
     try:
         while stream_sid in exotel_connections:
             buffer = outbound_audio_buffers.get(stream_sid)
@@ -287,8 +333,8 @@ async def connect_to_openai(stream_sid: str, person_name: str) -> websockets.Web
                 ############ New Changes Done ###############
                 "turn_detection": {
                     "type": "semantic_vad",
-                    "eagerness": "low" , 
-                    "create_response": True, 
+                    "eagerness": "high",
+                    "create_response": True,
                     "interrupt_response": True,
                 },
                 
@@ -300,13 +346,29 @@ async def connect_to_openai(stream_sid: str, person_name: str) -> websockets.Web
         
 
         await openai_ws.send(json.dumps(session_config))
-        
-        async for msg in openai_ws:
-            data = json.loads(msg)
-            if data.get("type") == "session.updated":
-                break
-        logger.info(f"OpenAI session ready for stream {stream_sid} - waiting for user input")
-        # logger.info(f"Triggering initial greeting for stream {stream_sid}")
+
+        async def wait_for_session_updated():
+            async for msg in openai_ws:
+                data = json.loads(msg)
+                if data.get("type") == "session.updated":
+                    return
+                if data.get("type") == "error":
+                    raise RuntimeError(f"OpenAI session error: {data}")
+
+        await asyncio.wait_for(wait_for_session_updated(), timeout=15.0)
+        logger.info(f"OpenAI session ready for stream {stream_sid} — triggering immediate greeting")
+
+        await openai_ws.send(json.dumps({
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": "(The phone call has just connected. Begin immediately with your opening greeting from the script. Do not wait for the customer to speak first.)"
+                }]
+            }
+        }))
         await openai_ws.send(json.dumps({"type": "response.create"}))
         return openai_ws
     except Exception as e:
@@ -325,10 +387,10 @@ async def handle_exotel_media(stream_sid: str, data: dict):
         try:
             pcm_audio = base64.b64decode(payload)
 
-
-            # ◉ Apply noise suppression here, before converting to μ-law:
-            # enhanced_pcm = apply_noise_suppression(pcm_audio)  # <-- Using the new, more effective function
-            enhanced_pcm = pcm_audio
+            if ENABLE_INBOUND_RNNOISE:
+                enhanced_pcm = process_audio_chunk(pcm_audio)
+            else:
+                enhanced_pcm = pcm_audio
             ulaw_audio = convert_pcm_to_ulaw(enhanced_pcm)
 
             # FIX: Initialize the buffer for this stream_sid if it's the first time we see it
@@ -344,7 +406,36 @@ async def handle_exotel_media(stream_sid: str, data: dict):
                     await openai_connections[stream_sid]["websocket"].send(json.dumps(audio_append_message))
         except Exception as e:
             logger.error(f"Error processing exotel media for stream {stream_sid}: {e}")
-    
+
+
+async def silence_timeout_handler(stream_sid: str, openai_ws: websockets.WebSocketClientProtocol, delay: float):
+    """Wait `delay` seconds after response.done (accounts for faster-than-realtime generation + Exotel latency), then re-prompt."""
+    try:
+        logger.info(f"Silence handler sleeping {delay:.1f}s for {stream_sid}")
+        await asyncio.sleep(delay)
+
+        if stream_sid not in openai_connections or stream_sid not in call_context:
+            return
+        if call_context[stream_sid].get("status") == "closing":
+            return
+        if openai_ws.closed:
+            return
+        await openai_ws.send(json.dumps({
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "(The customer has been silent for a while after you finished speaking. Say 'Are you still there?' and then repeat your last question exactly.)"}]
+            }
+        }))
+        await openai_ws.send(json.dumps({"type": "response.create"}))
+        logger.info(f"Silence timeout fired for stream {stream_sid} after {delay:.1f}s.")
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        logger.warning(f"Silence timeout handler error for {stream_sid}: {e}")
+    finally:
+        silence_timer_tasks.pop(stream_sid, None)
 
 
 async def handle_openai_responses(stream_sid: str, openai_ws: websockets.WebSocketClientProtocol):
@@ -356,27 +447,69 @@ async def handle_openai_responses(stream_sid: str, openai_ws: websockets.WebSock
 
             if response_type == 'response.audio.delta' and response.get('delta'):
                 ulaw_audio = base64.b64decode(response['delta'])
+                if stream_sid not in response_audio_tracking:
+                    response_audio_tracking[stream_sid] = {"start_time": time.time(), "ulaw_bytes": 0}
+                response_audio_tracking[stream_sid]["ulaw_bytes"] += len(ulaw_audio)
                 pcm_audio = convert_ulaw_to_pcm(ulaw_audio)
                 if stream_sid in outbound_audio_buffers:
                     outbound_audio_buffers[stream_sid].extend(pcm_audio)
-            
+
             elif response_type == 'response.audio_transcript.delta':
                 if stream_sid in ai_transcripts:
                     ai_transcripts[stream_sid] += response.get('delta', '')
-            
+
             elif response_type == 'response.audio_transcript.done':
                 logger.info(f"🤖 AI said: '{ai_transcripts.get(stream_sid, '')}' for stream {stream_sid}")
                 await handle_ai_commands(stream_sid, ai_transcripts.get(stream_sid, ''))
                 if stream_sid in ai_transcripts:
                     ai_transcripts[stream_sid] = ""
-            
+
             elif response_type == 'conversation.item.input_audio_transcription.completed':
                 logger.info(f"👤 User said: '{response.get('transcript', '')}' for stream {stream_sid}")
 
+            elif response_type == 'input_audio_buffer.speech_started':
+                if stream_sid in silence_timer_tasks:
+                    silence_timer_tasks[stream_sid].cancel()
+                    silence_timer_tasks.pop(stream_sid, None)
+                response_audio_tracking.pop(stream_sid, None)
+                logger.info(f"Barge-in detected for stream {stream_sid}, clearing outbound audio")
+                if stream_sid in outbound_audio_buffers:
+                    outbound_audio_buffers[stream_sid].clear()
+
+            elif response_type == 'response.done':
+                resp_status = response.get('response', {}).get('status')
+                if resp_status == 'cancelled':
+                    logger.info(f"Bot response cancelled (barge-in) for stream {stream_sid}")
+                    if stream_sid in outbound_audio_buffers:
+                        outbound_audio_buffers[stream_sid].clear()
+                    if stream_sid in ai_transcripts:
+                        ai_transcripts[stream_sid] = ""
+                    response_audio_tracking.pop(stream_sid, None)
+                else:
+                    tracking = response_audio_tracking.pop(stream_sid, None)
+                    if tracking:
+                        audio_duration = tracking["ulaw_bytes"] / ULAW_BYTES_PER_SECOND
+                        generation_time = time.time() - tracking["start_time"]
+                        remaining_playback = max(0.0, audio_duration - generation_time) + 2.0
+                    else:
+                        audio_duration = 0.0
+                        generation_time = 0.0
+                        remaining_playback = 2.0
+                    total_delay = remaining_playback + SILENCE_TIMEOUT_SECONDS
+                    if stream_sid in silence_timer_tasks:
+                        silence_timer_tasks[stream_sid].cancel()
+                        silence_timer_tasks.pop(stream_sid, None)
+                    silence_timer_tasks[stream_sid] = asyncio.create_task(
+                        silence_timeout_handler(stream_sid, openai_ws, total_delay)
+                    )
+                    logger.info(
+                        f"Silence timer for {stream_sid}: audio={audio_duration:.1f}s, gen={generation_time:.1f}s, "
+                        f"remaining_play={remaining_playback:.1f}s, total_delay={total_delay:.1f}s"
+                    )
 
             elif response_type == "error":
                 logger.error(f"❌ OpenAI Error for stream {stream_sid}: {response}")
-                
+
     except websockets.exceptions.ConnectionClosed as e:
         logger.warning(f"OpenAI connection closed for stream {stream_sid}: {e.reason} (Code: {e.code})")
     except Exception as e:
@@ -502,155 +635,96 @@ async def handle_ai_commands(stream_sid: str, message: str):
 
 
 async def cleanup_connections(stream_sid: Optional[str]):
-    print("openai connection", openai_connections)
-    print("exotel connections", exotel_connections)
     if not stream_sid:
         return
 
-    if stream_sid not in call_context and stream_sid not in exotel_connections:
-        logger.info(f"Cleanup for stream {stream_sid} already completed. Skipping.")
-        return
+    if stream_sid not in cleanup_locks:
+        cleanup_locks[stream_sid] = asyncio.Lock()
 
-    if stream_sid in call_context:
-        call_context[stream_sid]['status'] = 'closing'
-        logger.info(f"Status set to 'closing'. No more media will be processed.")
-        context = call_context[stream_sid]
-        print("context:::", call_context)
-        logger.info(f"Generating final report for stream {stream_sid}")
-        
-        result = CallResult(
-            ticketId=context.get('ticketId'),
-            callConnected=str(context.get('callConnected')),
-            slotSelected=str(context.get('slotSelected')),
-            selectedDate=context.get('selectedDate'),
-            selectedSlot=context.get('selectedSlot'),
-            comments=context.get('comments'),
-            sentiment=context.get('sentiment')
-        )
-        result_json = result.model_dump_json(indent=2)
-        print(":::::::::::::::::::::::::::::::",result_json)
-        
+    async with cleanup_locks[stream_sid]:
+        if stream_sid not in call_context and stream_sid not in exotel_connections:
+            logger.info(f"Cleanup for stream {stream_sid} already completed. Skipping.")
+            cleanup_locks.pop(stream_sid, None)
+            return
 
-        callback_url = context.get('callbackUrl')
-        if callback_url:
-            try:
-                async with httpx.AsyncClient() as client:
-                    logger.info(f"Sending final report to callback URL: {callback_url}")
+        if stream_sid in call_context:
+            call_context[stream_sid]['status'] = 'closing'
+            logger.info(f"Status set to 'closing' for stream {stream_sid}. No more media will be processed.")
+            context = call_context[stream_sid]
+            logger.info(f"Generating final report for stream {stream_sid}")
 
-                    # Authentication for production/local
-                    auth = httpx.BasicAuth(
-                        'e1b72f9c-3d54-45c1-8f62-94c7a6b2e718',
-                        'c5f1d8a3-1d4b-46f2-9b8c-73f2e2d9a8b7'
-                    )
-                    
-                    response = await client.post(
-                        callback_url,
-                        json=result.model_dump(),
-                        auth=auth,
-                        timeout=15.0
-                    )
+            result = CallResult(
+                ticketId=context.get('ticketId'),
+                callConnected=bool(context.get('callConnected')),
+                slotSelected=bool(context.get('slotSelected')),
+                selectedDate=context.get('selectedDate'),
+                selectedSlot=context.get('selectedSlot'),
+                comments=context.get('comments'),
+                sentiment=context.get('sentiment')
+            )
+            logger.info(f"Final report: {result.model_dump_json(indent=2)}")
 
-                    # Check if request was successful
-                    if response.status_code == 200:
-                        logger.info(f"✅ Payload successfully sent to {callback_url}")
-                    else:
-                        logger.error(
-                            f"❌ Failed to send payload. "
-                            f"Status: {response.status_code}, Response: {response.text}"
+            callback_url = context.get('callbackUrl')
+            if callback_url:
+                try:
+                    async with httpx.AsyncClient() as client:
+                        logger.info(f"Sending final report to callback URL: {callback_url}")
+
+                        auth = httpx.BasicAuth(
+                            'e1b72f9c-3d54-45c1-8f62-94c7a6b2e718',
+                            'c5f1d8a3-1d4b-46f2-9b8c-73f2e2d9a8b7'
                         )
 
-            except Exception as e:
-                logger.error(f"Failed to send result to callback URL {callback_url}: {e}")
+                        response = await client.post(
+                            callback_url,
+                            json=result.model_dump(),
+                            auth=auth,
+                            timeout=15.0
+                        )
 
-        
-        del call_context[stream_sid]
+                        if response.status_code == 200:
+                            logger.info(f"✅ Payload successfully sent to {callback_url}")
+                        else:
+                            logger.error(
+                                f"❌ Failed to send payload. "
+                                f"Status: {response.status_code}, Response: {response.text}"
+                            )
 
-    if stream_sid in sender_tasks:
-        sender_tasks[stream_sid].cancel()
-        del sender_tasks[stream_sid]
-    
-    if stream_sid in openai_connections:
-        ws = openai_connections[stream_sid]["websocket"]
-        print("openai_connections of stream_sid",openai_connections[stream_sid] )
-        if not ws.closed:
-            await ws.close()
-        del openai_connections[stream_sid]
-        
-    if stream_sid in exotel_connections:
-        ws = exotel_connections[stream_sid]["websocket"]
-        print("exotel_connections of stream_sid",exotel_connections[stream_sid])
-        try:
-            if ws.client_state.name == 'OPEN':
-                logger.info(f"Sending 'hangup' event to Exotel for stream {stream_sid}")
-                hangup_message = {
-                    "event": "hangup",
-                    "streamSid": stream_sid
-                }
-                await ws.send_json(hangup_message)
-                await asyncio.sleep(0.5)
+                except Exception as e:
+                    logger.error(f"Failed to send result to callback URL {callback_url}: {e}")
+
+            del call_context[stream_sid]
+
+        if stream_sid in sender_tasks:
+            sender_tasks[stream_sid].cancel()
+            del sender_tasks[stream_sid]
+
+        if stream_sid in silence_timer_tasks:
+            silence_timer_tasks[stream_sid].cancel()
+            silence_timer_tasks.pop(stream_sid, None)
+        response_audio_tracking.pop(stream_sid, None)
+
+        if stream_sid in openai_connections:
+            ws = openai_connections[stream_sid]["websocket"]
+            if not ws.closed:
                 await ws.close()
-        except Exception as e:
-            logger.warning(f"Could not cleanly send hangup/close for Exotel stream {stream_sid}: {e}")
-        finally:
-            del exotel_connections[stream_sid]
-        
-    for buf_dict in [audio_buffers, outbound_audio_buffers, ai_transcripts]:
-        buf_dict.pop(stream_sid, None)
+            del openai_connections[stream_sid]
 
-    logger.info(f"All resources for stream {stream_sid} have been cleaned up.")
+        if stream_sid in exotel_connections:
+            ws = exotel_connections[stream_sid]["websocket"]
+            try:
+                if ws.client_state.name == 'OPEN':
+                    logger.info(f"Sending 'hangup' event to Exotel for stream {stream_sid}")
+                    await ws.send_json({"event": "hangup", "streamSid": stream_sid})
+                    await asyncio.sleep(0.5)
+                    await ws.close()
+            except Exception as e:
+                logger.warning(f"Could not cleanly send hangup/close for Exotel stream {stream_sid}: {e}")
+            finally:
+                del exotel_connections[stream_sid]
 
+        for buf_dict in [audio_buffers, outbound_audio_buffers, ai_transcripts]:
+            buf_dict.pop(stream_sid, None)
 
-# ========================== MODIFIED NOISE CANCELLATION CODE =========================
-
-class RNNoiseProcessor:
-    def __init__(self):
-        # RNNoise operates at 48kHz
-        self.denoiser = RNNoise(sample_rate=48000)
-        self.telephony_rate = 8000
-        self.rnnoise_rate = 48000
-        self.frame_size_8k = 80  # 10ms at 8kHz
-        self.frame_size_48k = 480  # 10ms at 48kHz
-    def apply_noise_suppression(self, pcm_bytes: bytes) -> bytes:
-        """
-        Apply RNNoise noise suppression to 8kHz telephony audio.
-        Uses upsampling -> RNNoise -> downsampling pipeline.
-        Returns cleaned 16-bit PCM audio as bytes.
-        """
-        try:
-            # 1. Convert bytes to int16 array
-            audio_8k = np.frombuffer(pcm_bytes, dtype=np.int16)
-            # 2. Upsample from 8kHz to 48kHz (6x)
-            audio_48k = signal.resample_poly(audio_8k, 6, 1)
-            audio_48k = audio_48k.astype(np.int16)
-            # 3. Ensure we have correct frame size (480 samples for 48kHz)
-            # Pad if necessary
-            num_samples = len(audio_48k)
-            if num_samples < self.frame_size_48k:
-                audio_48k = np.pad(audio_48k, (0, self.frame_size_48k - num_samples))
-            # 4. Reshape for RNNoise (expects [channels, samples])
-            audio_48k_reshaped = audio_48k.reshape(1, -1)  # Mono
-            # 5. Process with RNNoise
-            denoised_frames = []
-            for speech_prob, denoised_frame in self.denoiser.denoise_chunk(audio_48k_reshaped):
-                denoised_frames.append(denoised_frame)
-            # 6. Concatenate all denoised frames
-            if denoised_frames:
-                denoised_48k = np.concatenate(denoised_frames, axis=1).flatten()
-            else:
-                denoised_48k = audio_48k
-            # 7. Downsample back to 8kHz
-            denoised_8k = signal.resample_poly(denoised_48k, 1, 6)
-            denoised_8k = denoised_8k.astype(np.int16)
-            # 8. Trim to original length
-            denoised_8k = denoised_8k[:len(audio_8k)]
-            return denoised_8k.tobytes()
-        except Exception as e:
-            logger.error(f"Error during RNNoise suppression: {e}")
-            return pcm_bytes
- 
-# Initialize once globally
-rnnoise_processor = RNNoiseProcessor()
- 
-# Use in your streaming loop
-def process_audio_chunk(pcm_bytes):
-    return rnnoise_processor.apply_noise_suppression(pcm_bytes)
+        cleanup_locks.pop(stream_sid, None)
+        logger.info(f"All resources for stream {stream_sid} have been cleaned up.")
