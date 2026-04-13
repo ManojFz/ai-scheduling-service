@@ -1,6 +1,7 @@
 import re
 import time
-from fastapi import  WebSocketDisconnect
+from fastapi import WebSocketDisconnect
+from starlette.websockets import WebSocketState
 import websockets
 import os
 import httpx
@@ -74,6 +75,7 @@ class ScheduleCallRequest(BaseModel):
     ticketId: str
     customerPhone: str
     callbackUrl: HttpUrl # Use HttpUrl for validation
+    address: str
     availableDates: List[TimeSlot]
 
 # Model for the final call report
@@ -85,6 +87,8 @@ class CallResult(BaseModel):
     selectedSlot: Optional[str] = None
     comments: Optional[str] = ""
     sentiment: Optional[int] = None
+    addressConfirmed: Optional[bool] = None
+    isReschedule: bool = False
 
 
 # --- In-memory Storage ---
@@ -99,83 +103,319 @@ call_context: Dict[str, Dict[str, Any]] = {}
 cleanup_locks: Dict[str, asyncio.Lock] = {}
 silence_timer_tasks: Dict[str, asyncio.Task] = {}
 response_audio_tracking: Dict[str, Dict[str, Any]] = {}
+address_reject_fallback_tasks: Dict[str, asyncio.Task] = {}
 SILENCE_TIMEOUT_SECONDS = 6.0
+
+
+def extract_ticket_id_from_exotel_message(data: dict) -> Optional[str]:
+    """Try to read ticketId from Exotel Voicebot `start` (CustomField / custom_parameters vary by version)."""
+    st = data.get("start")
+    if isinstance(st, dict):
+        cp = st.get("custom_parameters") or st.get("customParameters")
+        if isinstance(cp, dict):
+            for key in ("ticketId", "ticket_id", "TicketId"):
+                v = cp.get(key)
+                if v is not None and str(v).strip():
+                    return str(v).strip()
+        for key in ("ticketId", "ticket_id", "TicketId"):
+            v = st.get(key)
+            if v is not None and str(v).strip():
+                return str(v).strip()
+        for key in ("custom_field", "CustomField"):
+            raw = st.get(key)
+            if isinstance(raw, str) and raw.strip():
+                try:
+                    obj = json.loads(raw)
+                    if isinstance(obj, dict):
+                        for tk in ("ticketId", "ticket_id"):
+                            if obj.get(tk) is not None and str(obj[tk]).strip():
+                                return str(obj[tk]).strip()
+                except json.JSONDecodeError:
+                    pass
+    return None
+
+
+def link_stream_sid_to_call_context(
+    stream_sid: str,
+    call_sid: str,
+    data: dict,
+    query_ticket_id: Optional[str] = None,
+) -> None:
+    """
+    Attach initiate-schedule-call payload to this media stream.
+    The CallSid on the Voicebot WebSocket often does not match the Sid returned by Calls/connect.json;
+    we also register context under ticketId so the start event can still be matched.
+    """
+    ctx_obj: Optional[Dict[str, Any]] = call_context.pop(call_sid, None)
+    tid_ws = extract_ticket_id_from_exotel_message(data)
+    if ctx_obj is None and tid_ws:
+        ctx_obj = call_context.pop(f"ticket:{tid_ws}", None)
+    if ctx_obj is None and query_ticket_id and str(query_ticket_id).strip():
+        ctx_obj = call_context.pop(f"ticket:{str(query_ticket_id).strip()}", None)
+
+    if ctx_obj is not None:
+        tid = ctx_obj.get("ticketId")
+        if tid:
+            call_context.pop(f"ticket:{tid}", None)
+        for k in list(call_context.keys()):
+            if call_context.get(k) is ctx_obj:
+                del call_context[k]
+        call_context[stream_sid] = ctx_obj
+        logger.info(
+            "Linked call context stream_sid=%s ticketId=%s exotel_call_sid=%s",
+            stream_sid,
+            ctx_obj.get("ticketId"),
+            call_sid,
+        )
+        return
+
+    logger.warning(
+        "No call context for call_sid=%s ticket_from_ws=%s query_ticket=%s — using UNKNOWN. "
+        "start keys: %s",
+        call_sid,
+        tid_ws,
+        query_ticket_id,
+        list((data.get("start") or {}).keys()) if isinstance(data.get("start"), dict) else [],
+    )
+    call_context[stream_sid] = {
+        "ticketId": "UNKNOWN",
+        "callbackUrl": None,
+        "address": "",
+        "availableDates": [],
+        "addressConfirmed": None,
+        "last_assistant_message": "",
+        "isReschedule": False,
+    }
+
+
+# Injected when user rejects address via STT; model must speak goodbye then end with TAG_ADDRESS_REJECT.
+ADDRESS_REJECT_GOODBYE_USER_PROMPT = (
+    "(System notice — the customer has indicated the service address is NOT correct. "
+    "Speak ONE short closing only, in the customer's already-selected language (English, Hindi, or Kannada — "
+    "same as the rest of this call). "
+    "Include: apologize for the inconvenience; say you cannot continue scheduling without the correct address; "
+    "say our team will get back to them soon (English example: "
+    "\"Sorry for the inconvenience. We cannot continue without the correct address. "
+    "We'll get back to you soon. Goodbye.\" — translate naturally for Hindi or Kannada); end with a brief goodbye. "
+    "Do not ask any questions. Do not mention dates or time slots. "
+    "On the VERY LAST LINE of your reply only, output exactly TAG_ADDRESS_REJECT (system use only; never speak it aloud)."
+)
 ULAW_BYTES_PER_SECOND = 8000
+
+
+def _parse_hhmm_token(part: str) -> Optional[tuple[int, int]]:
+    part = part.strip()
+    m = re.match(r"^(\d{1,2}):(\d{2})$", part)
+    if not m:
+        return None
+    h, mi = int(m.group(1)), int(m.group(2))
+    if h > 23 or mi > 59:
+        return None
+    return h, mi
+
+
+def _format_clock_12h(h: int, mi: int) -> str:
+    h12 = h % 12
+    if h12 == 0:
+        h12 = 12
+    ap = "AM" if h < 12 else "PM"
+    if mi == 0:
+        return f"{h12} {ap}"
+    return f"{h12}:{mi:02d} {ap}"
+
+
+def _slot_range_payload_to_spoken_cue(raw: str) -> Optional[str]:
+    """
+    Map payload like '11:00-14:00' or '09:00–11:00' to '11 AM to 2 PM' (never '11 to 14').
+    Returns None if the string is not a simple HH:MM–HH:MM range.
+    """
+    s = raw.strip()
+    for sep in ("–", "—", "−"):
+        s = s.replace(sep, "-")
+    if "-" not in s:
+        return None
+    left, _, right = s.partition("-")
+    a, b = _parse_hhmm_token(left), _parse_hhmm_token(right)
+    if not a or not b:
+        return None
+    return f"{_format_clock_12h(a[0], a[1])} to {_format_clock_12h(b[0], b[1])}"
+
+
+def _slot_list_for_prompt(slots: List[str]) -> str:
+    """Join slots with explicit 'say as' cues for 24h ranges."""
+    parts: List[str] = []
+    for raw in slots:
+        cue = _slot_range_payload_to_spoken_cue(raw)
+        if cue:
+            parts.append(f"{raw} (say aloud: {cue})")
+        else:
+            parts.append(raw)
+    return ", ".join(parts) if parts else "(no slots listed)"
+
+
+def _iter_available_date_rows(available_dates_obj: Any) -> List[tuple[str, List[str]]]:
+    """Normalize payload `availableDates` to (YYYY-MM-DD, [slot strings])."""
+    rows: List[tuple[str, List[str]]] = []
+    for item in available_dates_obj or []:
+        if isinstance(item, TimeSlot):
+            rows.append((str(item.date).strip(), [str(s) for s in (item.slots or [])]))
+        elif isinstance(item, dict):
+            slots = item.get("slots") or []
+            rows.append((str(item.get("date", "")).strip(), [str(s) for s in slots]))
+        elif hasattr(item, "date") and hasattr(item, "slots"):
+            rows.append(
+                (
+                    str(getattr(item, "date")).strip(),
+                    [str(s) for s in list(getattr(item, "slots") or [])],
+                )
+            )
+    return [r for r in rows if r[0]]
+
+
+def build_scheduling_calendar_prompt_parts(available_dates_obj: Any) -> tuple[str, str, str, str]:
+    """
+    Build prompt injections for multi-date scheduling.
+    Returns (available_dates_summary, scheduling_mode_instructions, scheduled_date_fallback, available_slots_fallback).
+    """
+    rows = _iter_available_date_rows(available_dates_obj)
+    if not rows:
+        summary = "  (No appointment dates were provided in the system payload.)"
+        mode = (
+            "NO_DATES_MODE: No valid dates were provided. After address confirmation, apologize briefly that no slots "
+            "are available in the system and say our team will reach out; do not invent dates or times."
+        )
+        return summary, mode, "No date", ""
+
+    lines: List[str] = []
+    for d, slots in rows:
+        slot_part = _slot_list_for_prompt(slots)
+        lines.append(f"  - {d} (canonical YYYY-MM-DD — match customer speech to this row only): slots {slot_part}")
+    summary = "\n".join(lines)
+
+    if len(rows) == 1:
+        d0, slots0 = rows[0]
+        slot_list = _slot_list_for_prompt(slots0) if slots0 else ""
+        mode = (
+            "SINGLE_DATE_MODE: There is exactly ONE appointment date in the system list. After you thank the customer for "
+            "confirming the address, do NOT ask them to choose among several dates. Go directly to time-slot selection "
+            f"for date {d0} only. The only valid slots for that date are: {slot_list}. "
+            "Speak each slot using the '(say aloud: …)' twelve-hour wording; never read raw hour numbers like '11 to 14'."
+        )
+        return summary, mode, d0, slot_list
+
+    mode = (
+        "MULTIPLE_DATE_MODE: After you thank the customer for confirming the address, ask them to choose an appointment DATE. "
+        "List **every** date from the canonical list above in spoken form (full date in their language). "
+        "Immediately after listing those dates, also offer a **reschedule option** (English example: "
+        "\"Or if none of these dates work for you, do you need us to reschedule?\" — translate naturally for Hindi or Kannada). "
+        "Do NOT read time slots until either (A) a listed date is chosen and confirmed, or (B) the customer chooses reschedule.\n"
+        "PATH A — Pick a listed date: When they indicate one of the system dates, map to exactly one YYYY-MM-DD row. "
+        "Confirm (English): \"So you would like [spoken date] — is that correct?\" Only after clear YES, present ONLY that date's time slots, "
+        "then slot confirmation and booking flow as usual.\n"
+        "PATH B — Reschedule: If they say they need to reschedule / none of these work / similar, first confirm intent "
+        "(English example: \"You would like us to reschedule — is that correct?\"). "
+        "Only after they clearly say YES: thank them for confirming, say you will note the reschedule request, "
+        "that the team will get back to them soon, and goodbye. Do NOT book a slot. "
+        "On the VERY LAST LINE only, output exactly TAG_RESCHEDULE_DONE (system use; never speak it aloud)."
+    )
+    first_d, first_slots = rows[0]
+    return summary, mode, first_d, ", ".join(first_slots)
 
 
 ###################################### 2025 -09 -10 evening prompt ###############################################
 SYSTEM_PROMPT_TEMPLATE = """
 CORE DIRECTIVES
 LANGUAGE SELECTION:
-At the start of the conversation, you MUST first ask the customer to select their preferred language from: English, Hindi, Telugu, Tamil or Kannada.
+At the start of the conversation, you MUST first ask the customer to select their preferred language from: English, Hindi, or Kannada.
 If the input is unclear, background noise, or not one of the supported languages, DO NOT auto-select.
 Politely ask the customer to repeat:
-👉 “I’m sorry, I didn’t catch that. Could you please say English, Hindi, Telugu, Tamil or Kannada?”
+👉 “I’m sorry, I didn’t catch that. Could you please say English, Hindi, or Kannada?”
 Once a supported language is detected, confirm with the customer **in that detected language**:
 👉 “You selected [Language]. Is that correct? ”
 Only if the customer clearly says YES (or equivalent affirmation), lock in the language and proceed.
 If the customer says NO or does not confirm, repeat the selection step again.
-Do not proceed to Step 1 until the language is both detected AND confirmed.
+Do not proceed to the address step until the language is both detected AND confirmed.
 
 STRICTLY FORBIDDEN:
-NO MIXED LANGUAGES: Under NO circumstances are you to use any other language after the customer has confirmed their language preference. This rule applies to all prompts and all dynamic data. For example, if Tamil is selected, dates ("September 20th") and times ("3 PM") MUST be spoken only in Tamil, not a mix of Tamil and English.
-NO INTERNAL DATA: Never speak or reference internal system commands, JSON data, sentiment scores, booking commands, numbers used for internal purposes, or hangup commands.
+NO MIXED LANGUAGES: Under NO circumstances are you to use any other language after the customer has confirmed their language preference. This rule applies to all prompts and all dynamic data. For example, if Hindi is selected, dates and times MUST be spoken only in Hindi, not a mix of Hindi and English.
+NO INTERNAL DATA: Never speak or reference internal system commands, JSON data, sentiment scores, booking commands, numbers used for internal purposes, hangup commands, or tokens such as TAG_ADDRESS_REJECT or TAG_RESCHEDULE_DONE.
 DO NOT READ BRACKETS: Never speak or read aloud any text inside curly braces {} or square brackets []. These are internal system placeholders or instructions, not part of the script to be spoken to the customer.
 
 PERSONA:
 You are a friendly and efficient AI scheduling assistant for FieldEZ. Your tone should be clear, friendly, and natural, not robotic.
 
 STRICT SELECTION RULE:
-You should not select any date or slot by yourself until the user explicitly tells you. If you are not sure what the user has selected (date or slot), then you must ask again. Do not assume.
+Every valid appointment date and time range comes **only** from the canonical system list below. You must not invent, change, or merge dates or slots. Do not choose a date or time slot on behalf of the customer. If you are unsure what they chose, ask again. Do not assume.
+
+TIME SLOT SPEECH (mandatory):
+Payloads may show windows like `11:00-14:00` (24-hour). You MUST speak them in **twelve-hour AM/PM** using the `(say aloud: …)` cue next to each slot in the system list (e.g. **11 AM to 2 PM**, not "11 to 14"). **Never** read only the hour digits as two numbers (e.g. never "nine to eleven" for `09:00-11:00` in the wrong style, and never "eleven to fourteen"). In Hindi/Kannada, express the same twelve-hour meaning naturally.
 
 BACKGROUND NOISE HANDLING:
 If the response is unclear, garbled, or nonsensical, DO NOT guess. Politely ask them to repeat in their selected language.
 
 YOUR TASK
 Ticket ID for this call: {{ticket_id}}
-Available dates and slots for the customer: {{available_dates}}
+The customer’s service address (use exactly this text where the script says to read the address): {{customer_address}}
+
+{{scheduling_mode_instructions}}
+
+Canonical schedule from the system (never offer dates or slots that are not listed here):
+{{available_dates_summary}}
 
 MANDATORY CONVERSATION FLOW
 Step 0 (LANGUAGE SELECTION)
-👉 “Hello! I'm calling from DELL Service to schedule your appointment. To better assist you, please select your preferred language: English,  Hindi, Telugu, Tamil, or Kannada.”
+👉 “Hello! I'm calling from DELL Service to schedule your appointment. To better assist you, please select your preferred language: English, Hindi, or Kannada.”
 If unclear/noise/invalid → repeat request.
 Once detected → MUST confirm **in that detected language**:
 👉 “You selected [Language]. Is that correct?”
 Only proceed after YES/affirmation.
 
-Step 1 (DATE SELECTION)
-Greet the customer in their selected language.
-State ONLY the available dates (not times), **ensuring they are spoken in the selected language**.
+Step 1 (SERVICE ADDRESS CONFIRMATION)
+Immediately after language is locked in, speak **in the customer’s selected language** using this structure (for English, follow it closely; for other languages, translate the same meaning naturally):
+👉 “Your appointment is scheduled at the following address:
+{{customer_address}}.
+Please confirm if this address is correct.”
+Read the address line exactly as given above ({{customer_address}}). Do not change spelling or omit parts of the address when you read it aloud.
+Do **not** ask the customer to provide, spell, or dictate a different or “correct” address. The only question is whether **this** address is correct (yes/no, correct/wrong, or equivalent).
 Rules:
-If the customer response is unclear, noise, or not a valid available date → politely ask  them to repeat.
-Do not auto-select.
-Once a date is detected, repeat back using month name + day for clarity (**in the selected language**).
-👉 Example: “You selected September 20th, 2025. Is that correct?”
-Only after YES/affirmation → proceed to time slot selection.
-(Internally, store the date as YYYY-MM-DD, but always speak it back as ‘Month Day, Year’ in the customer’s selected language.)
+If the customer says NO, wrong, incorrect, not correct, or clearly rejects the address → apologize briefly (e.g. sorry for the inconvenience), say you cannot continue without the correct address, say our team will get back to them soon, say goodbye, and **end the conversation**. Do NOT ask for dates or times.
+If you must disconnect for a wrong address, put the exact token TAG_ADDRESS_REJECT alone on the very last line of your response (system use only; do not speak this token aloud).
+If you receive a system notice that the address was rejected, follow it exactly: speak that closing apology and callback promise in the customer's language, then TAG_ADDRESS_REJECT on the last line only.
+If the customer says YES, correct, right, or clearly confirms the address → **first** acknowledge with a short thanks for confirming the address **in their selected language** (English example: “Thanks for confirming the address.”), **then** follow **{{scheduling_mode_instructions}}** for date and slot steps — do not skip this thanks.
+If unclear or noise → ask them to repeat. Do not assume.
 
-Step 2 (TIME SLOT SELECTION)
-Present the available slots in 12-hour AM/PM format (**spoken in the selected language**).
-Rules:
-If the customer response is unclear, noise, or not one of the valid slots → politely ask them to repeat.
-Do not auto-select.
-Once a slot is detected, repeat back for confirmation (**in the selected language**):
-👉 “You selected [Time Slot]. Is that correct?”
-Only after YES/affirmation → proceed.
+Step 2 (DATE AND TIME — obey {{scheduling_mode_instructions}})
+
+SINGLE_DATE_MODE:
+After thanks for confirming the address, go straight to time slots for the **only** date in the canonical list. In the customer’s language (English example; translate for Hindi or Kannada):
+👉 “We can schedule your appointment. For [spoken form of that date], the available time slots are: [list **only** valid slots for that date in 12-hour AM/PM]. Please choose one.”
+If unclear → ask them to repeat. Do not auto-select a slot. After they choose, confirm: “You selected [Time Slot]. Is that correct?” Only after YES → continue toward Step 4.
+
+MULTIPLE_DATE_MODE:
+2a — After thanks for confirming the address, ask them to **select an appointment date**, list **only** the dates from the canonical list (spoken in full form), **then** add one more option: if they need **reschedule** instead because none of those dates work (see {{scheduling_mode_instructions}}). Do not read time slots yet.
+2b — **Pick a listed date:** match their choice to one YYYY-MM-DD row. Confirm: “So you would like [spoken date] — is that correct?” Only after clear YES continue.
+2c — Offer **only** the slots for that confirmed date. Confirm slot with YES before proceeding.
+2d — **Reschedule path:** If they want reschedule, confirm (English): “You would like us to reschedule — is that correct?” After clear YES: thank them, say you will reschedule and the team will get back to them soon, goodbye. Last line only: TAG_RESCHEDULE_DONE (never spoken). End the call; do not offer slots.
+
+NO_DATES_MODE:
+After address confirmation, explain politely that no schedule was loaded and our team will follow up; do not invent slots.
+
+Shared: Never offer slots for a date the customer has not confirmed in MULTIPLE_DATE_MODE.
 
 Step 3 (BOOKING CONFIRMATION - INTERNAL CHECK)
 (Internal Check - Do Not Speak)
-Condition: You MUST NOT proceed to Step 4 until you have received two separate "YES" affirmations from the customer:
-1. The "YES" for the date (from Step 1).
-2. The "YES" for the time slot (from Step 2).
+You MUST NOT proceed to Step 4 until:
+1. Confirmed service address from Step 1.
+2. MULTIPLE_DATE_MODE: customer has **confirmed with YES** which appointment date (one YYYY-MM-DD from the list) before slots were offered for that date.
+3. SINGLE_DATE_MODE: the single system date is the appointment date for slot selection.
+4. A clear **YES** for the chosen **time slot** after you asked “Is that correct?” for the slot.
 
-Formatting Rule: When you prepare the final message for Step 4:
-[Spoken Date] MUST be formatted as ‘Month Day, Year’ (e.g., "September 20th, 2025").
-[Spoken Time] MUST be formatted as '12-hour AM/PM' (e.g., "3 PM to 4 PM").
-These formats must be spoken in the customer's selected language.
-The internal data { "date": ... } and { "time": ... } is for system use only and must not be spoken.
+Formatting Rule for Step 4:
+[Spoken Date] = the appointment date being booked (the only date in SINGLE_DATE_MODE, or the date the customer confirmed in MULTIPLE_DATE_MODE). Say it as ‘Month Day, Year’ in their language.
+[Spoken Time] = chosen slot in 12-hour AM/PM (e.g., “9 AM to 11 AM”) in their language.
+Raw codes and internal JSON are for system use only and must not be read aloud.
 
-Action: Once both "YES" confirmations are received, proceed immediately to Step 4.
+Action: When all conditions above are met, proceed immediately to Step 4.
 
 Step 4 (FINAL TURN)
 ✅ If the customer CONFIRMS the booking, strictly respond (in their selected language). You must say the date and time in the spoken format as defined in Step 3.
@@ -183,10 +423,6 @@ English:
 "Thank you for booking with us. Your appointment is CONFIRMED for [Spoken Date] at [Spoken Time]. Looking forward to helping you! Good Bye..."
 Hindi:
 "हमारे साथ बुकिंग करने के लिए धन्यवाद। आपकी अपॉइंटमेंट [Spoken Date] को [Spoken Time] के लिए CONFIRMED की गई है। आपको मदद करने की प्रतीक्षा रहेगी! अलविदा..."
-Telugu:
-"మాతో బుకింగ్ చేసినందుకు ధన్యవాదాలు. మీ అపాయింట్మెంట్ [Spoken Date] తేదీ [Spoken Time]కి CONFIRMED చేయబడింది. మీకు సహాయం చేయడానికి ఎదురుచూస్తున్నాం! నమస్తే..."
-Tamil:
-"எங்களுடன் முன்பதிவு செய்ததற்கு நன்றி. உங்கள் நேர்காணல் [Spoken Date] அன்று [Spoken Time]க்கு CONFIRMED செய்யப்பட்டுள்ளது. உங்களுக்கு உதவ காத்திருக்கிறோம்! வணக்கம்..."
 Kannada:
 "ನಮ್ಮೊಂದಿಗೆ ಬುಕ್ಕಿಂಗ್ ಮಾಡಿದಕ್ಕಾಗಿ ಧನ್ಯವಾದಗಳು. ನಿಮ್ಮ ಅಪಾಯಿಂಟ್ಮೆಂಟ್ [Spoken Date] ರಂದು [Spoken Time]ಕ್ಕೆ CONFIRMED ಮಾಡಲಾಗಿದೆ. ನಿಮಗೆ ಸಹಾಯ ಮಾಡಲು ನಾವು ಎದುರು ನೋಡುತ್ತಿದ್ದೇವೆ! ವಿದಾಯ..."
 
@@ -195,17 +431,13 @@ English:
 "Thank you for your time. I understand that you would like to DECLINE the booking for now, and thank you for sharing your { "comments": "<comments>" }. If you change your mind, please don't hesitate to call us for rescheduling. Wishing you a great day! Good Bye!..."
 Hindi:
 "आपके समय के लिए धन्यवाद। मैं समझता हूँ कि आप अभी के लिए बुकिंग DECLINE करना चाहते हैं, और आपके { "comments": "<comments>" } साझा करने के लिए धन्यवाद। अगर आप अपना मन बदलते हैं, तो कृपया हमें कॉल करके पुनः शेड्यूल करें। आपको शुभ दिन की शुभकामनाएँ! अलविदा..."
-Telugu:
-"మీ సమయానికి ధన్యవాదాలు. మీరు ప్రస్తుతం బుకింగ్‌ను DECLINE చేయాలని అనుకుంటున్నారని నేను అర్థం చేసుకున్నాను, మరియు మీ { "comments": "<comments>" } పంచుకున్నందుకు ధన్యవాదాలు. మీ అభిప్రాయం మారితే, దయచేసి మమ్మల్ని సంప్రదించి రీషెడ్యూల్ చేసుకోండి. మీ రోజు శుభంగా గడవాలి! నమస్తే..."
-Tamil:
-"உங்கள் நேரத்திற்கு நன்றி. நீங்கள் இப்போது முன்பதிவை DECLINE செய்ய விரும்புகிறீர்கள் என்பதை நான் புரிந்துகொள்கிறேன், மேலும் உங்கள் { "comments": "<comments>" } பகிர்ந்ததற்கு நன்றி. உங்கள் மனம் மாறினால், தயவுசெய்து எங்களை அழைத்து மீண்டும் அட்டவணைப்படுத்தவும். உங்களுக்கு இனிய நாள் வாழ்த்துக்கள்! வணக்கம்..."
 Kannada:
 "ನಿಮ್ಮ ಸಮಯಕ್ಕೆ ಧನ್ಯವಾದಗಳು. ನೀವು ಈಗಾಗಲೇ ಬುಕ್ಕಿಂಗ್ DECLINE ಮಾಡಲು ಬಯಸುತ್ತೀರಿ ಎಂದು ನಾನು ಅರ್ಥಮಾಡಿಕೊಂಡಿದ್ದೇನೆ, ಮತ್ತು ನಿಮ್ಮ { "comments": "<comments>" } ಹಂಚಿಕೊಂಡಿದ್ದಕ್ಕೆ ಧನ್ಯವಾದಗಳು. ನಿಮ್ಮ ಅಭಿಪ್ರಾಯ ಬದಲಾದರೆ, ದಯವಿಟ್ಟು ನಮಗೆ ಕರೆ ಮಾಡಿ ಮರುನಿಗದಿಪಡಿಸಿಕೊಳ್ಳಿ. ನಿಮಗೆ ಶುಭ ದಿನವಾಗಲಿ! ವಿದಾಯ..."
 
 ABSOLUTE RULES
 Do NOT accept or process any input while you are speaking. Always finish your full prompt first.
 Ignore background noise while speaking.
-Always confirm language, date, and time before finalizing.
+Always confirm language, service address, date, and time before finalizing.
 Never cut your prompt short. Always complete full sentences.
 Add a natural half-second pause at the end of each prompt before listening.
 """
@@ -266,6 +498,147 @@ def process_audio_chunk(pcm_bytes: bytes) -> bytes:
     return rnnoise_processor.apply_noise_suppression(pcm_bytes)
 
 
+def _is_asking_address_confirmation(last_assistant: str) -> bool:
+    if not last_assistant:
+        return False
+    low = last_assistant.lower()
+    if not any(k in low for k in ("address", "location", "visit")):
+        return False
+    return any(k in low for k in ("correct", "confirm", "right", "accurate", "okay", "ok", "sure"))
+
+
+def _classify_address_confirmation(text: str) -> Optional[str]:
+    """Return 'positive', 'negative', or None if unclear."""
+    if not text or not text.strip():
+        return None
+    t = text.strip()
+    t_low = t.lower()
+    if re.search(
+        r"\b(no|wrong|incorrect|not correct|not right|mistake|change|not accurate|bad address|different address)\b",
+        t_low,
+        re.I,
+    ):
+        return "negative"
+    if re.search(r"\b(nahi|galat)\b", t_low, re.I):
+        return "negative"
+    if re.search(r"नहीं|गलत|ಇಲ್ಲ", t):
+        return "negative"
+    if re.search(
+        r"\b(yes|yeah|correct|right|ok|okay|sure|confirm|accurate|fine|good)\b",
+        t_low,
+        re.I,
+    ):
+        return "positive"
+    if re.search(r"\b(haan|hmm|sahi)\b", t_low, re.I):
+        return "positive"
+    if re.search(r"हाँ|हा|ಹೌದು", t):
+        return "positive"
+    return None
+
+
+def _callback_comments(context: Dict[str, Any]) -> str:
+    """addressConfirmed False → 'Address is wrong'; True → ''."""
+    ac = context.get("addressConfirmed")
+    if ac is False:
+        return "Address is wrong"
+    if ac is True:
+        return ""
+    return (context.get("comments") or "").strip()
+
+
+async def _address_reject_hangup_fallback(stream_sid: str) -> None:
+    """If the model never emits TAG_ADDRESS_REJECT, still end the call after a grace period."""
+    try:
+        await asyncio.sleep(48.0)
+        ctx = call_context.get(stream_sid)
+        if not ctx or ctx.get("status") == "closing":
+            return
+        if not ctx.get("address_reject_pending_disconnect"):
+            return
+        logger.warning(
+            "Address-reject closing: no TAG_ADDRESS_REJECT after timeout; hanging up stream %s",
+            stream_sid,
+        )
+        await cleanup_connections(stream_sid)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        address_reject_fallback_tasks.pop(stream_sid, None)
+
+
+async def _request_address_reject_goodbye(stream_sid: str) -> None:
+    """Let the bot speak a scripted apology + callback promise, then hang up via TAG_ADDRESS_REJECT."""
+    ctx = call_context.get(stream_sid)
+    if not ctx or ctx.get("status") == "closing":
+        return
+    ctx["address_reject_pending_disconnect"] = True
+
+    prev = address_reject_fallback_tasks.pop(stream_sid, None)
+    if prev and not prev.done():
+        prev.cancel()
+        try:
+            await prev
+        except asyncio.CancelledError:
+            pass
+
+    conn = openai_connections.get(stream_sid)
+    openai_ws = conn["websocket"] if conn else None
+    if not openai_ws or openai_ws.closed:
+        logger.warning("No OpenAI socket for address-reject goodbye; hanging up stream %s", stream_sid)
+        await cleanup_connections(stream_sid)
+        return
+
+    try:
+        await openai_ws.send(
+            json.dumps(
+                {
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": ADDRESS_REJECT_GOODBYE_USER_PROMPT}],
+                    },
+                }
+            )
+        )
+        await openai_ws.send(json.dumps({"type": "response.create"}))
+        logger.info(f"Requested address-reject goodbye turn for stream {stream_sid}")
+    except Exception as e:
+        logger.error(f"Failed to request address-reject goodbye for {stream_sid}: {e}", exc_info=True)
+        await cleanup_connections(stream_sid)
+        return
+
+    address_reject_fallback_tasks[stream_sid] = asyncio.create_task(
+        _address_reject_hangup_fallback(stream_sid)
+    )
+
+
+async def handle_user_address_response(stream_sid: str, transcript: str):
+    if not transcript or stream_sid not in call_context:
+        return
+    ctx = call_context[stream_sid]
+    if ctx.get("status") == "closing":
+        return
+    if not ctx.get("address"):
+        return
+    if ctx.get("addressConfirmed") is not None:
+        return
+    last = ctx.get("last_assistant_message") or ""
+    if not _is_asking_address_confirmation(last):
+        return
+    verdict = _classify_address_confirmation(transcript)
+    if verdict == "positive":
+        ctx["addressConfirmed"] = True
+        ctx["comments"] = ""
+        logger.info(f"Address confirmed by user for stream {stream_sid}")
+    elif verdict == "negative":
+        ctx["addressConfirmed"] = False
+        ctx["comments"] = "Address is wrong"
+        ctx["slotSelected"] = False
+        logger.info(f"Address rejected by user for stream {stream_sid}, requesting goodbye before hangup")
+        await _request_address_reject_goodbye(stream_sid)
+
+
 async def paced_audio_sender(stream_sid: str):
     logger.info(f"✅ Starting Optimized Audio Sender for stream {stream_sid}")
     prebuffer_threshold = Config.CHUNK_BYTES * 2
@@ -313,14 +686,17 @@ async def connect_to_openai(stream_sid: str, person_name: str) -> websockets.Web
         context = call_context.get(stream_sid, {})
         ticket_id = context.get('ticketId', 'N/A')
         available_dates_obj = context.get('availableDates', [])
-        
-        dates_str = "\n".join(
-            [f"- {item.date}: " + ", ".join(item.slots) for item in available_dates_obj]
+        dates_summary, mode_instructions, _, _ = build_scheduling_calendar_prompt_parts(
+            available_dates_obj
         )
-        if not dates_str:
-            dates_str = "No dates are currently available."
 
-        system_message = SYSTEM_PROMPT_TEMPLATE.replace("{{ticket_id}}", ticket_id).replace("{{available_dates}}", dates_str)
+        address_str = context.get("address") or "Not provided."
+        system_message = (
+            SYSTEM_PROMPT_TEMPLATE.replace("{{ticket_id}}", ticket_id)
+            .replace("{{scheduling_mode_instructions}}", mode_instructions)
+            .replace("{{available_dates_summary}}", dates_summary)
+            .replace("{{customer_address}}", address_str)
+        )
         print("system_message:::", system_message)
 
         session_config = {
@@ -459,13 +835,18 @@ async def handle_openai_responses(stream_sid: str, openai_ws: websockets.WebSock
                     ai_transcripts[stream_sid] += response.get('delta', '')
 
             elif response_type == 'response.audio_transcript.done':
-                logger.info(f"🤖 AI said: '{ai_transcripts.get(stream_sid, '')}' for stream {stream_sid}")
-                await handle_ai_commands(stream_sid, ai_transcripts.get(stream_sid, ''))
+                full_transcript = ai_transcripts.get(stream_sid, '')
+                if stream_sid in call_context:
+                    call_context[stream_sid]["last_assistant_message"] = full_transcript
+                logger.info(f"🤖 AI said: '{full_transcript}' for stream {stream_sid}")
+                await handle_ai_commands(stream_sid, full_transcript)
                 if stream_sid in ai_transcripts:
                     ai_transcripts[stream_sid] = ""
 
             elif response_type == 'conversation.item.input_audio_transcription.completed':
-                logger.info(f"👤 User said: '{response.get('transcript', '')}' for stream {stream_sid}")
+                ut = response.get("transcript", "")
+                logger.info(f"👤 User said: '{ut}' for stream {stream_sid}")
+                await handle_user_address_response(stream_sid, ut)
 
             elif response_type == 'input_audio_buffer.speech_started':
                 if stream_sid in silence_timer_tasks:
@@ -541,12 +922,40 @@ async def handle_ai_commands(stream_sid: str, message: str):
     normalized_msg = message
 
     print(":::::::::::::::::::::::", normalized_msg)
-    # Detect booking status
+    if re.search(r"\bTAG_ADDRESS_REJECT\b", normalized_msg, re.I):
+        if stream_sid in call_context:
+            call_context[stream_sid].update({
+                "addressConfirmed": False,
+                "comments": "Address is wrong",
+                "slotSelected": False,
+                "address_reject_pending_disconnect": False,
+            })
+        t = address_reject_fallback_tasks.pop(stream_sid, None)
+        if t and not t.done():
+            t.cancel()
+        await cleanup_connections(stream_sid)
+        return
+
+    if re.search(r"\bTAG_RESCHEDULE_DONE\b", normalized_msg, re.I):
+        if stream_sid in call_context:
+            call_context[stream_sid].update(
+                {
+                    "isReschedule": True,
+                    "slotSelected": False,
+                    "selectedDate": None,
+                    "selectedSlot": None,
+                    "comments": "Customer requested reschedule; team to follow up.",
+                }
+            )
+        await cleanup_connections(stream_sid)
+        return
+
+    # Detect booking status (avoid CONFIRMING — matches "Thanks for confirming" on reschedule closings)
     status = None
-    if re.search(r'\b(CONFIRM|CONFIRMED|CONFIRMING)\b', normalized_msg):
-        status = 'Confirmed'
-    elif re.search(r'\b(DECLINE|DECLINED|DECLINING)\b', normalized_msg):
-        status = 'Declined'
+    if re.search(r"\bCONFIRMED\b", normalized_msg, re.I):
+        status = "Confirmed"
+    elif re.search(r"\b(DECLINE|DECLINED|DECLINING)\b", normalized_msg, re.I):
+        status = "Declined"
 
     if not status:
         print({
@@ -557,7 +966,7 @@ async def handle_ai_commands(stream_sid: str, message: str):
         })
     else:
 
-        template = """You are an expert AI assistant specializing in Natural Language Understanding for multiple Indian languages and English. Your task is to analyze the user's message provided below. The message can be in Telugu, Hindi, Tamil, English, or Kannada.
+        template = """You are an expert AI assistant specializing in Natural Language Understanding for multiple Indian languages and English. Your task is to analyze the user's message provided below. The message can be in Hindi, English, or Kannada.
 
     Carefully perform the following five actions:
     1.  **Extract the Status:** Determine if the user is confirming or declining a booking. Use 'confirmed' or 'declined'. If neither, use 'neutral'.
@@ -582,7 +991,7 @@ async def handle_ai_commands(stream_sid: str, message: str):
             "sentiment" : 10
         }}
 
-        UserMessage : "నాకు ఈ వారం కుదరదు, వచ్చే వారం కాల్ చేయండి." (Telugu for: I am not free this week, call me next week.)
+        UserMessage : "इस हफ्ते मैं फ्री नहीं हूँ, अगले हफ्ते कॉल करें।" (Hindi for: I am not free this week, call me next week.)
 
         Output : {{
             "status": "declined",
@@ -616,13 +1025,17 @@ async def handle_ai_commands(stream_sid: str, message: str):
             
             # Update your context with the extracted data
             if stream_sid in call_context:
-                call_context[stream_sid].update({
+                upd: Dict[str, Any] = {
                     "slotSelected": True if date_out and time_out else False,
                     "selectedDate": date_out,
                     "selectedSlot": re.sub(r'[–—‒−]', '-', str(time_out)),
                     "comments": comments_out,
-                    "sentiment": sentiment_out
-                })
+                    "sentiment": sentiment_out,
+                }
+                if merged_data.get("status") == "confirmed" and date_out and time_out:
+                    upd["addressConfirmed"] = True
+                    upd["comments"] = ""
+                call_context[stream_sid].update(upd)
                 
         except json.JSONDecodeError as e:
             logger.error(f"Failed to decode JSON from LLM: {e}")
@@ -642,6 +1055,10 @@ async def cleanup_connections(stream_sid: Optional[str]):
         cleanup_locks[stream_sid] = asyncio.Lock()
 
     async with cleanup_locks[stream_sid]:
+        ft = address_reject_fallback_tasks.pop(stream_sid, None)
+        if ft and not ft.done():
+            ft.cancel()
+
         if stream_sid not in call_context and stream_sid not in exotel_connections:
             logger.info(f"Cleanup for stream {stream_sid} already completed. Skipping.")
             cleanup_locks.pop(stream_sid, None)
@@ -659,8 +1076,10 @@ async def cleanup_connections(stream_sid: Optional[str]):
                 slotSelected=bool(context.get('slotSelected')),
                 selectedDate=context.get('selectedDate'),
                 selectedSlot=context.get('selectedSlot'),
-                comments=context.get('comments'),
-                sentiment=context.get('sentiment')
+                comments=_callback_comments(context),
+                sentiment=context.get('sentiment'),
+                addressConfirmed=context.get('addressConfirmed'),
+                isReschedule=bool(context.get('isReschedule')),
             )
             logger.info(f"Final report: {result.model_dump_json(indent=2)}")
 
@@ -704,24 +1123,24 @@ async def cleanup_connections(stream_sid: Optional[str]):
             silence_timer_tasks.pop(stream_sid, None)
         response_audio_tracking.pop(stream_sid, None)
 
+        # Exotel: closing the media WebSocket ends the Voicebot leg and advances the flow (e.g. to Hangup).
+        # Starlette uses WebSocketState.CONNECTED — never "OPEN", so the old check never ran close().
+        if stream_sid in exotel_connections:
+            ws = exotel_connections[stream_sid]["websocket"]
+            try:
+                if ws.client_state != WebSocketState.DISCONNECTED:
+                    logger.info(f"Closing Exotel media WebSocket for stream {stream_sid} (ends call leg)")
+                    await ws.close(code=1000)
+            except Exception as e:
+                logger.warning(f"Could not cleanly close Exotel WebSocket for stream {stream_sid}: {e}")
+            finally:
+                del exotel_connections[stream_sid]
+
         if stream_sid in openai_connections:
             ws = openai_connections[stream_sid]["websocket"]
             if not ws.closed:
                 await ws.close()
             del openai_connections[stream_sid]
-
-        if stream_sid in exotel_connections:
-            ws = exotel_connections[stream_sid]["websocket"]
-            try:
-                if ws.client_state.name == 'OPEN':
-                    logger.info(f"Sending 'hangup' event to Exotel for stream {stream_sid}")
-                    await ws.send_json({"event": "hangup", "streamSid": stream_sid})
-                    await asyncio.sleep(0.5)
-                    await ws.close()
-            except Exception as e:
-                logger.warning(f"Could not cleanly send hangup/close for Exotel stream {stream_sid}: {e}")
-            finally:
-                del exotel_connections[stream_sid]
 
         for buf_dict in [audio_buffers, outbound_audio_buffers, ai_transcripts]:
             buf_dict.pop(stream_sid, None)

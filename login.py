@@ -23,8 +23,8 @@ app = FastAPI(title="Schedule API")
 
 
 
-PUBLIC_WS_BASE = "https://fieldez-hjbzfyhjb6dsdsdw.centralindia-01.azurewebsites.net"
-# PUBLIC_WS_BASE = "https://jameson-nondiscriminative-zaiden.ngrok-free.dev"
+# PUBLIC_WS_BASE = "https://fieldez-hjbzfyhjb6dsdsdw.centralindia-01.azurewebsites.net"
+PUBLIC_WS_BASE = "https://jameson-nondiscriminative-zaiden.ngrok-free.dev"
 
 
 
@@ -34,7 +34,10 @@ async def initiate_schedule_call(payload: ScheduleCallRequest):
     url = f"https://{EXOTEL_SUBDOMAIN}/v1/Accounts/{EXOTEL_SID}/Calls/connect.json"
     flow_url = f"http://my.exotel.com/{EXOTEL_SID}/exoml/start_voice/{EXOTEL_FLOW_APP_ID}"
    
-    custom_field_data = {"name": f"Customer-{payload.customerPhone[-4:]}"}
+    custom_field_data = {
+        "name": f"Customer-{payload.customerPhone[-4:]}",
+        "ticketId": payload.ticketId,
+    }
    
     form_data = {
         "From": payload.customerPhone,
@@ -61,9 +64,10 @@ async def initiate_schedule_call(payload: ScheduleCallRequest):
  
             logger.info(f"Call initiated with CallSid: {call_sid}")
            
-            call_context[call_sid] = {
+            ctx = {
                 "ticketId": payload.ticketId,
                 "callbackUrl": str(payload.callbackUrl),
+                "address": payload.address,
                 "availableDates": payload.availableDates,
                 "callConnected": True,
                 "slotSelected": False,
@@ -71,8 +75,13 @@ async def initiate_schedule_call(payload: ScheduleCallRequest):
                 "selectedSlot": None,
                 "comments": "",
                 "sentiment": None,
-                "status" : "active"
+                "addressConfirmed": None,
+                "last_assistant_message": "",
+                "status": "active",
+                "isReschedule": False,
             }
+            call_context[call_sid] = ctx
+            call_context[f"ticket:{str(payload.ticketId).strip()}"] = ctx
  
             return JSONResponse(status_code=resp.status_code, content={"result": call_details, "status": "success"})
     except Exception as e:
@@ -98,13 +107,12 @@ async def handle_media_stream(websocket: WebSocket):
             if event == 'start':
                 stream_sid = data['start']['stream_sid']
                 call_sid = data['start']['call_sid']
-               
-                if call_sid in call_context:
-                    call_context[stream_sid] = call_context.pop(call_sid)
-                    logger.info(f"Context found for CallSid {call_sid}, linked to StreamSid {stream_sid}")
-                else:
-                    logger.warning(f"No context found for CallSid {call_sid}. Call may not function as expected.")
-                    call_context[stream_sid] = { "ticketId": "UNKNOWN", "callbackUrl": None, "availableDates": [] }
+                link_stream_sid_to_call_context(
+                    stream_sid,
+                    call_sid,
+                    data,
+                    query_ticket_id=websocket.query_params.get("ticketId"),
+                )
  
                 exotel_connections[stream_sid] = {"websocket": websocket, "call_sid": call_sid}
                 audio_buffers[stream_sid] = b""
@@ -194,6 +202,7 @@ async def exotel_webhook(request: Request):
             "selectedSlot": None,
             "comments": f"Customer did not answer the call. Status: {call_status}",
             "sentiment": 0,  # Should be integer, not string
+            "addressConfirmed": None,
         }
 
         if callback_url:
