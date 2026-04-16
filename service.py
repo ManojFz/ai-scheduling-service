@@ -1087,30 +1087,50 @@ async def cleanup_connections(stream_sid: Optional[str]):
             if callback_url:
                 try:
                     async with httpx.AsyncClient() as client:
-                        logger.info(f"Sending final report to callback URL: {callback_url}")
+                        logger.info(
+                            "Callback POST starting | ticketId=%s url=%s",
+                            context.get("ticketId"),
+                            callback_url,
+                        )
 
                         auth = httpx.BasicAuth(
                             'e1b72f9c-3d54-45c1-8f62-94c7a6b2e718',
                             'c5f1d8a3-1d4b-46f2-9b8c-73f2e2d9a8b7'
                         )
 
-                        response = await client.post(
+                        http_resp = await client.post(
                             callback_url,
                             json=result.model_dump(),
                             auth=auth,
                             timeout=15.0
                         )
 
-                        if response.status_code == 200:
-                            logger.info(f"✅ Payload successfully sent to {callback_url}")
+                        body_preview = (http_resp.text or "")[:500]
+                        if http_resp.status_code == 200:
+                            logger.info(
+                                "Callback POST OK | ticketId=%s status=%s url=%s body_preview=%r",
+                                context.get("ticketId"),
+                                http_resp.status_code,
+                                callback_url,
+                                body_preview,
+                            )
                         else:
                             logger.error(
-                                f"❌ Failed to send payload. "
-                                f"Status: {response.status_code}, Response: {response.text}"
+                                "Callback POST non-200 | ticketId=%s status=%s url=%s body=%r",
+                                context.get("ticketId"),
+                                http_resp.status_code,
+                                callback_url,
+                                body_preview,
                             )
 
                 except Exception as e:
-                    logger.error(f"Failed to send result to callback URL {callback_url}: {e}")
+                    logger.error(
+                        "Callback POST exception | ticketId=%s url=%s error=%s",
+                        context.get("ticketId"),
+                        callback_url,
+                        e,
+                        exc_info=True,
+                    )
 
             del call_context[stream_sid]
 

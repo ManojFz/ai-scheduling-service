@@ -23,8 +23,9 @@ app = FastAPI(title="Schedule API")
 
 
 
-# PUBLIC_WS_BASE = "https://fieldez-hjbzfyhjb6dsdsdw.centralindia-01.azurewebsites.net"
-PUBLIC_WS_BASE = "https://jameson-nondiscriminative-zaiden.ngrok-free.dev"
+PUBLIC_WS_BASE = "https://fieldez-hjbzfyhjb6dsdsdw.centralindia-01.azurewebsites.net"
+# PUBLIC_WS_BASE = "https://fieldeztata-poc-a4abeebch0h2hrcz.centralindia-01.azurewebsites.net"
+# PUBLIC_WS_BASE = "https://jameson-nondiscriminative-zaiden.ngrok-free.dev"
 
 
 
@@ -208,13 +209,40 @@ async def exotel_webhook(request: Request):
         if callback_url:
             try:
                 async with httpx.AsyncClient() as client:
-                    logger.info(f"Sending no-answer report to callback URL: {callback_url}")
+                    logger.info(
+                        "No-answer callback POST starting | ticketId=%s url=%s",
+                        ticket_id,
+                        callback_url,
+                    )
                     auth = httpx.BasicAuth('e1b72f9c-3d54-45c1-8f62-94c7a6b2e718', 'c5f1d8a3-1d4b-46f2-9b8c-73f2e2d9a8b7')
-                    await client.post(callback_url, json=response, auth=auth, timeout=15.0)
+                    http_resp = await client.post(callback_url, json=response, auth=auth, timeout=15.0)
+                    body_preview = (http_resp.text or "")[:500]
+                    if http_resp.status_code == 200:
+                        logger.info(
+                            "No-answer callback POST OK | ticketId=%s status=%s url=%s body_preview=%r",
+                            ticket_id,
+                            http_resp.status_code,
+                            callback_url,
+                            body_preview,
+                        )
+                    else:
+                        logger.error(
+                            "No-answer callback POST non-200 | ticketId=%s status=%s url=%s body=%r",
+                            ticket_id,
+                            http_resp.status_code,
+                            callback_url,
+                            body_preview,
+                        )
             except Exception as e:
-                logger.error(f"Failed to send result to callback URL {callback_url}: {e}")
+                logger.error(
+                    "No-answer callback POST exception | ticketId=%s url=%s error=%s",
+                    ticket_id,
+                    callback_url,
+                    e,
+                    exc_info=True,
+                )
 
-        logger.info(f"Sending no-answer response: {response}")
+        logger.info(f"No-answer webhook payload (to Exotel): {response}")
         return JSONResponse(content=response)
  
     # For other statuses, just acknowledge
