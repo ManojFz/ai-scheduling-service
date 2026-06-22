@@ -10,7 +10,6 @@ librosa
 langchain
 langchain-openai
 langchain-core
-pyrnnoise
 scipy
 soundfile
 azure-identity

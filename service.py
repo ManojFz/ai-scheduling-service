@@ -13,7 +13,6 @@ import asyncio
 import logging
 import audioop
 import numpy as np
-from pyrnnoise import RNNoise
 from scipy import signal
 from langchain_openai import AzureChatOpenAI
 from langchain_core.prompts import PromptTemplate
@@ -44,8 +43,14 @@ EXOTEL_CALLER_ID = os.getenv("EXOTEL_CALLER_ID")
 
 # Inbound RNNoise: default off; set ENABLE_INBOUND_RNNOISE=1 to enable.
 ENABLE_INBOUND_RNNOISE = os.getenv("ENABLE_INBOUND_RNNOISE", "0").lower() in ("1", "true", "yes")
+RNNoise = None
 if ENABLE_INBOUND_RNNOISE:
-    logger.info("ENABLE_INBOUND_RNNOISE is enabled — inbound audio uses RNNoise")
+    try:
+        from pyrnnoise import RNNoise
+        logger.info("ENABLE_INBOUND_RNNOISE is enabled — inbound audio uses RNNoise")
+    except Exception as e:
+        ENABLE_INBOUND_RNNOISE = False
+        logger.warning("RNNoise requested but unavailable; continuing without noise suppression: %s", e)
 
 
 # Azure OpenAI configuration
@@ -77,6 +82,9 @@ class ScheduleCallRequest(BaseModel):
     callbackUrl: HttpUrl # Use HttpUrl for validation
     address: str
     availableDates: List[TimeSlot]
+
+class PrepareInboundCallRequest(ScheduleCallRequest):
+    callSid: str
 
 # Model for the final call report
 class CallResult(BaseModel):
@@ -322,22 +330,57 @@ def build_scheduling_calendar_prompt_parts(available_dates_obj: Any) -> tuple[st
     return summary, mode, first_d, ", ".join(first_slots)
 
 
+_EMPTY_ADDRESS_LABEL_RE = re.compile(
+    r"^(city|state|pin\s*code|pincode|zip|country|district)\s*:\s*$",
+    re.IGNORECASE,
+)
+_TRAILING_EMPTY_ADDRESS_LABEL_RE = re.compile(
+    r"\s+(City|State|Pin\s*Code|Pincode|Zip|Country|District)\s*:\s*$",
+    re.IGNORECASE,
+)
+
+
+def _address_part_key(part: str) -> str:
+    return re.sub(r"\s+", " ", part.strip().lower())
+
+
+def summarize_address_for_speech(address: str) -> str:
+    """Collapse duplicate segments and empty labels for clearer phone readback."""
+    if not address or not str(address).strip():
+        return "Not provided."
+    raw = str(address).strip()
+    parts = re.split(r"[,;]", raw)
+    cleaned: List[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        segment = re.sub(r"\s+", " ", part.strip())
+        if not segment or _EMPTY_ADDRESS_LABEL_RE.match(segment):
+            continue
+        segment = _TRAILING_EMPTY_ADDRESS_LABEL_RE.sub("", segment).strip()
+        if not segment or _EMPTY_ADDRESS_LABEL_RE.match(segment):
+            continue
+        key = _address_part_key(segment)
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(segment)
+    return ", ".join(cleaned) if cleaned else raw
+
+
 ###################################### 2025 -09 -10 evening prompt ###############################################
 SYSTEM_PROMPT_TEMPLATE = """
 CORE DIRECTIVES
-LANGUAGE SELECTION:
-At the start of the conversation, you MUST first ask the customer to select their preferred language from: English, Hindi, or Kannada.
+OPENING AND LANGUAGE SELECTION:
+At the start of the conversation, speak Step 0a and Step 0b in English first, in order, before asking for language.
+Then ask the customer to select their preferred language from: English, Hindi, or Kannada.
 If the input is unclear, background noise, or not one of the supported languages, DO NOT auto-select.
 Politely ask the customer to repeat:
 👉 “I’m sorry, I didn’t catch that. Could you please say English, Hindi, or Kannada?”
-Once a supported language is detected, confirm with the customer **in that detected language**:
-👉 “You selected [Language]. Is that correct? ”
-Only if the customer clearly says YES (or equivalent affirmation), lock in the language and proceed.
-If the customer says NO or does not confirm, repeat the selection step again.
-Do not proceed to the address step until the language is both detected AND confirmed.
+Once a supported language is clearly detected (e.g. the customer says “English”, “Hindi”, or “Kannada”), lock in that language immediately and proceed to Step 1 — do NOT ask “You selected [Language]. Is that correct?” or any other confirmation.
+Do not proceed to the address step until a supported language is clearly detected.
 
 STRICTLY FORBIDDEN:
-NO MIXED LANGUAGES: Under NO circumstances are you to use any other language after the customer has confirmed their language preference. This rule applies to all prompts and all dynamic data. For example, if Hindi is selected, dates and times MUST be spoken only in Hindi, not a mix of Hindi and English.
+NO MIXED LANGUAGES: Under NO circumstances are you to use any other language after the customer's language preference is locked in. This rule applies to all prompts and all dynamic data. For example, if Hindi is selected, dates and times MUST be spoken only in Hindi, not a mix of Hindi and English.
 NO INTERNAL DATA: Never speak or reference internal system commands, JSON data, sentiment scores, booking commands, numbers used for internal purposes, hangup commands, or tokens such as TAG_ADDRESS_REJECT or TAG_RESCHEDULE_DONE.
 DO NOT READ BRACKETS: Never speak or read aloud any text inside curly braces {} or square brackets []. These are internal system placeholders or instructions, not part of the script to be spoken to the customer.
 
@@ -355,7 +398,7 @@ If the response is unclear, garbled, or nonsensical, DO NOT guess. Politely ask 
 
 YOUR TASK
 Ticket ID for this call: {{ticket_id}}
-The customer’s service address (use exactly this text where the script says to read the address): {{customer_address}}
+The customer’s service address for this call (pre-summarized for phone readback — read exactly this text): {{customer_address}}
 
 {{scheduling_mode_instructions}}
 
@@ -363,19 +406,25 @@ Canonical schedule from the system (never offer dates or slots that are not list
 {{available_dates_summary}}
 
 MANDATORY CONVERSATION FLOW
-Step 0 (LANGUAGE SELECTION)
-👉 “Hello! I'm calling from DELL Service to schedule your appointment. To better assist you, please select your preferred language: English, Hindi, or Kannada.”
-If unclear/noise/invalid → repeat request.
-Once detected → MUST confirm **in that detected language**:
-👉 “You selected [Language]. Is that correct?”
-Only proceed after YES/affirmation.
+Step 0 (OPENING — speak in this exact order before anything else)
+
+Step 0a (INTRO — always speak in English):
+👉 “Hello! I am calling from Dell scheduling regarding your service appointment.”
+
+Step 0b (RECORDING NOTICE — always speak in English immediately after Step 0a):
+👉 “This call will be recorded for training and quality purposes.”
+
+Step 0c (LANGUAGE SELECTION — after Step 0a and 0b):
+👉 “To better assist you, please select your preferred language: English, Hindi, or Kannada.”
+If unclear/noise/invalid → repeat the language request only (do not repeat 0a/0b unless the call restarted).
+Once a supported language is clearly detected → lock it in immediately and proceed to Step 1. Do NOT confirm with “You selected [Language]. Is that correct?”
 
 Step 1 (SERVICE ADDRESS CONFIRMATION)
 Immediately after language is locked in, speak **in the customer’s selected language** using this structure (for English, follow it closely; for other languages, translate the same meaning naturally):
 👉 “Your appointment is scheduled at the following address:
 {{customer_address}}.
 Please confirm if this address is correct.”
-Read the address line exactly as given above ({{customer_address}}). Do not change spelling or omit parts of the address when you read it aloud.
+Read the address exactly as given above ({{customer_address}}). Do not translate the address into Hindi or Kannada, do not shorten it further, and do not change spelling or omit parts when you read it aloud — regardless of the customer’s selected language.
 Do **not** ask the customer to provide, spell, or dictate a different or “correct” address. The only question is whether **this** address is correct (yes/no, correct/wrong, or equivalent).
 Rules:
 If the customer says NO, wrong, incorrect, not correct, or clearly rejects the address → apologize briefly (e.g. sorry for the inconvenience), say you cannot continue without the correct address, say our team will get back to them soon, say goodbye, and **end the conversation**. Do NOT ask for dates or times.
@@ -437,7 +486,7 @@ Kannada:
 ABSOLUTE RULES
 Do NOT accept or process any input while you are speaking. Always finish your full prompt first.
 Ignore background noise while speaking.
-Always confirm language, service address, date, and time before finalizing.
+Always confirm service address, date, and time before finalizing.
 Never cut your prompt short. Always complete full sentences.
 Add a natural half-second pause at the end of each prompt before listening.
 """
@@ -491,10 +540,12 @@ class RNNoiseProcessor:
             return pcm_bytes
 
 
-rnnoise_processor = RNNoiseProcessor()
+rnnoise_processor = RNNoiseProcessor() if ENABLE_INBOUND_RNNOISE and RNNoise is not None else None
 
 
 def process_audio_chunk(pcm_bytes: bytes) -> bytes:
+    if rnnoise_processor is None:
+        return pcm_bytes
     return rnnoise_processor.apply_noise_suppression(pcm_bytes)
 
 
@@ -690,7 +741,10 @@ async def connect_to_openai(stream_sid: str, person_name: str) -> websockets.Web
             available_dates_obj
         )
 
-        address_str = context.get("address") or "Not provided."
+        raw_address = context.get("address") or "Not provided."
+        address_str = summarize_address_for_speech(raw_address)
+        if address_str != raw_address:
+            logger.info("Summarized address for stream %s: %s", stream_sid, address_str)
         system_message = (
             SYSTEM_PROMPT_TEMPLATE.replace("{{ticket_id}}", ticket_id)
             .replace("{{scheduling_mode_instructions}}", mode_instructions)
@@ -741,7 +795,7 @@ async def connect_to_openai(stream_sid: str, person_name: str) -> websockets.Web
                 "role": "user",
                 "content": [{
                     "type": "input_text",
-                    "text": "(The phone call has just connected. Begin immediately with your opening greeting from the script. Do not wait for the customer to speak first.)"
+                    "text": "(The phone call has just connected. Begin immediately with Step 0a, then Step 0b, then Step 0c from the script. Do not wait for the customer to speak first. Do not skip any opening step.)"
                 }]
             }
         }))

@@ -68,7 +68,7 @@ async def initiate_schedule_call(payload: ScheduleCallRequest):
             ctx = {
                 "ticketId": payload.ticketId,
                 "callbackUrl": str(payload.callbackUrl),
-                "address": payload.address,
+                "address": summarize_address_for_speech(payload.address),
                 "availableDates": payload.availableDates,
                 "callConnected": True,
                 "slotSelected": False,
@@ -88,6 +88,49 @@ async def initiate_schedule_call(payload: ScheduleCallRequest):
     except Exception as e:
         logger.error(f"Error starting call: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error starting call: {str(e)}")
+
+
+@app.post("/prepare-inbound-call")
+async def prepare_inbound_call(payload: PrepareInboundCallRequest):
+    call_sid = str(payload.callSid).strip()
+    ticket_id = str(payload.ticketId).strip()
+    if not call_sid:
+        raise HTTPException(status_code=400, detail="callSid is required.")
+    if not ticket_id:
+        raise HTTPException(status_code=400, detail="ticketId is required.")
+
+    ctx = {
+        "ticketId": payload.ticketId,
+        "callbackUrl": str(payload.callbackUrl),
+        "address": summarize_address_for_speech(payload.address),
+        "availableDates": payload.availableDates,
+        "callConnected": True,
+        "slotSelected": False,
+        "selectedDate": None,
+        "selectedSlot": None,
+        "comments": "",
+        "sentiment": None,
+        "addressConfirmed": None,
+        "last_assistant_message": "",
+        "status": "active",
+        "isReschedule": False,
+        "inbound": True,
+        "customerPhone": payload.customerPhone,
+    }
+    call_context[call_sid] = ctx
+    call_context[f"ticket:{ticket_id}"] = ctx
+
+    logger.info(
+        "Prepared inbound call context callSid=%s ticketId=%s customerPhone=%s dates=%s",
+        call_sid,
+        ticket_id,
+        payload.customerPhone,
+        len(payload.availableDates),
+    )
+    return JSONResponse(
+        status_code=200,
+        content={"status": "ok", "callSid": call_sid, "ticketId": ticket_id},
+    )
 
 
 
