@@ -71,6 +71,7 @@ async def initiate_schedule_call(payload: ScheduleCallRequest):
                 "address": summarize_address_for_speech(payload.address),
                 "availableDates": payload.availableDates,
                 "callConnected": True,
+                "isLineBusy": False,
                 "slotSelected": False,
                 "selectedDate": None,
                 "selectedSlot": None,
@@ -105,6 +106,7 @@ async def prepare_inbound_call(payload: PrepareInboundCallRequest):
         "address": summarize_address_for_speech(payload.address),
         "availableDates": payload.availableDates,
         "callConnected": True,
+        "isLineBusy": False,
         "slotSelected": False,
         "selectedDate": None,
         "selectedSlot": None,
@@ -224,8 +226,9 @@ async def exotel_webhook(request: Request):
    
     logger.info(f"Extracted - Status: {call_status}, CallSid: {call_sid}")
    
-    # Handle no-answer or failed calls
+    # Handle no-answer, busy, or failed calls
     if call_status in ["no-answer", "failed", "busy", "no_answer"]:
+        is_line_busy = call_status == "busy"
         # Find the ticket_id and callbackUrl from call_context using call_sid
         ticket_id = None
         callback_url = None
@@ -237,15 +240,25 @@ async def exotel_webhook(request: Request):
                 callback_url = context_value.get("callbackUrl")
                 context_to_update = context_value
                 break
-       
+
+        if context_to_update is not None:
+            context_to_update["callConnected"] = False
+            context_to_update["isLineBusy"] = is_line_busy
+
+        comments = (
+            "Customer line was busy."
+            if is_line_busy
+            else f"Customer did not answer the call. Status: {call_status}"
+        )
         response = {
-            "ticketId": ticket_id,  # Now properly retrieved from context
+            "ticketId": ticket_id,
             "callConnected": False,
+            "isLineBusy": is_line_busy,
             "slotSelected": False,
             "selectedDate": None,
             "selectedSlot": None,
-            "comments": f"Customer did not answer the call. Status: {call_status}",
-            "sentiment": 0,  # Should be integer, not string
+            "comments": comments,
+            "sentiment": 0,
             "addressConfirmed": None,
         }
 

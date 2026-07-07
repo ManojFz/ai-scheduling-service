@@ -7,7 +7,6 @@ numpy
 httpx
 pydantic
 librosa
-langchain
 langchain-openai
 langchain-core
 scipy

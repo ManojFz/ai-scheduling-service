@@ -90,6 +90,7 @@ class PrepareInboundCallRequest(ScheduleCallRequest):
 class CallResult(BaseModel):
     ticketId: str
     callConnected: bool = False
+    isLineBusy: bool = False
     slotSelected: bool = False
     selectedDate: Optional[str] = None
     selectedSlot: Optional[str] = None
@@ -338,18 +339,30 @@ _TRAILING_EMPTY_ADDRESS_LABEL_RE = re.compile(
     r"\s+(City|State|Pin\s*Code|Pincode|Zip|Country|District)\s*:\s*$",
     re.IGNORECASE,
 )
+_PINCODE_RE = re.compile(r"^\d{6}$")
+_PINCODE_LABEL_RE = re.compile(r"^(?:pin\s*code|pincode|zip)\s*:\s*(\d{6})\s*$", re.IGNORECASE)
+_CITY_LABEL_RE = re.compile(r"^city\s*:\s*(.+)$", re.IGNORECASE)
+_ORG_RE = re.compile(
+    r"\b(private limited|pvt\.?\s*ltd|limited|ltd\.?|llp|inc|corp|corporation|services)\b",
+    re.IGNORECASE,
+)
+_BUILDING_RE = re.compile(
+    r"\b(tower|building|block|wing|solarium|campus|complex|plaza|centre|center|tech\s*park|it\s*park|bagmane|argon)\b",
+    re.IGNORECASE,
+)
+_LOCALITY_RE = re.compile(
+    r"\b(road|street|lane|village|hobli|nagar|layout|cross|sector|phase|plot|area|main)\b",
+    re.IGNORECASE,
+)
+_FLOOR_ONLY_RE = re.compile(r"^floors?\s*#?\d", re.IGNORECASE)
 
 
 def _address_part_key(part: str) -> str:
     return re.sub(r"\s+", " ", part.strip().lower())
 
 
-def summarize_address_for_speech(address: str) -> str:
-    """Collapse duplicate segments and empty labels for clearer phone readback."""
-    if not address or not str(address).strip():
-        return "Not provided."
-    raw = str(address).strip()
-    parts = re.split(r"[,;]", raw)
+def _parse_address_parts(address: str) -> List[str]:
+    parts = re.split(r"[,;]", str(address).strip())
     cleaned: List[str] = []
     seen: set[str] = set()
     for part in parts:
@@ -364,7 +377,85 @@ def summarize_address_for_speech(address: str) -> str:
             continue
         seen.add(key)
         cleaned.append(segment)
-    return ", ".join(cleaned) if cleaned else raw
+    return cleaned
+
+
+def _classify_address_part(part: str, *, is_first: bool) -> str:
+    pin_match = _PINCODE_LABEL_RE.match(part)
+    if pin_match:
+        return "pincode"
+    if _PINCODE_RE.match(part):
+        return "pincode"
+    city_match = _CITY_LABEL_RE.match(part)
+    if city_match and city_match.group(1).strip():
+        return "city"
+    if _FLOOR_ONLY_RE.match(part):
+        return "skip"
+    if is_first and _ORG_RE.search(part):
+        return "company"
+    if _BUILDING_RE.search(part) and not _LOCALITY_RE.search(part):
+        return "building"
+    if _LOCALITY_RE.search(part):
+        return "locality"
+    if is_first:
+        return "company"
+    if _BUILDING_RE.search(part):
+        return "building"
+    return "other"
+
+
+def summarize_address_for_speech(address: str) -> str:
+    """Short phone readback: company, locality, building, city, pincode (max 5 parts)."""
+    if not address or not str(address).strip():
+        return "Not provided."
+    parts = _parse_address_parts(address)
+    if not parts:
+        return str(address).strip()
+
+    company: List[str] = []
+    locality: List[str] = []
+    building: List[str] = []
+    city: List[str] = []
+    pincode: List[str] = []
+    other: List[str] = []
+
+    for i, part in enumerate(parts):
+        kind = _classify_address_part(part, is_first=(i == 0))
+        if kind == "skip":
+            continue
+        if kind == "company":
+            company.append(part)
+        elif kind == "locality":
+            locality.append(part)
+        elif kind == "building":
+            building.append(part)
+        elif kind == "city":
+            city_match = _CITY_LABEL_RE.match(part)
+            city.append(city_match.group(1).strip() if city_match else part)
+        elif kind == "pincode":
+            pin_match = _PINCODE_LABEL_RE.match(part)
+            pincode.append(pin_match.group(1) if pin_match else part)
+        else:
+            other.append(part)
+
+    if not company and other:
+        company.append(other.pop(0))
+
+    segments: List[str] = []
+    if company:
+        segments.append(company[0])
+    if locality:
+        segments.append(", ".join(locality))
+    if building:
+        segments.append(", ".join(building))
+    if city:
+        segments.append(city[0])
+    if pincode:
+        segments.append(pincode[0])
+
+    if not segments:
+        return ", ".join(parts[:5])
+    return ", ".join(segments[:5])
 
 
 ###################################### 2025 -09 -10 evening prompt ###############################################
@@ -398,7 +489,7 @@ If the response is unclear, garbled, or nonsensical, DO NOT guess. Politely ask 
 
 YOUR TASK
 Ticket ID for this call: {{ticket_id}}
-The customer’s service address for this call (pre-summarized for phone readback — read exactly this text): {{customer_address}}
+The customer’s service address for this call (short summary for phone readback — max 5 parts: company, locality, building, city, pincode — read exactly this text): {{customer_address}}
 
 {{scheduling_mode_instructions}}
 
@@ -1127,6 +1218,7 @@ async def cleanup_connections(stream_sid: Optional[str]):
             result = CallResult(
                 ticketId=context.get('ticketId'),
                 callConnected=bool(context.get('callConnected')),
+                isLineBusy=bool(context.get('isLineBusy')),
                 slotSelected=bool(context.get('slotSelected')),
                 selectedDate=context.get('selectedDate'),
                 selectedSlot=context.get('selectedSlot'),
