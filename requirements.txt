@@ -1,5 +1,5 @@
 fastapi
-uvicorn
+uvicorn==0.30.6
 python-jose
 python-multipart
 websockets==10.4
@@ -13,4 +13,5 @@ scipy
 soundfile
 azure-identity
 azure-core
+azure-cognitiveservices-speech
 python-dotenv

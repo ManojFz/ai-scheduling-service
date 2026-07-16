@@ -23,9 +23,9 @@ app = FastAPI(title="Schedule API")
 
 
 
-PUBLIC_WS_BASE = "https://fieldez-hjbzfyhjb6dsdsdw.centralindia-01.azurewebsites.net"
+# PUBLIC_WS_BASE = "https://fieldez-hjbzfyhjb6dsdsdw.centralindia-01.azurewebsites.net"
 # PUBLIC_WS_BASE = "https://fieldeztata-poc-a4abeebch0h2hrcz.centralindia-01.azurewebsites.net"
-# PUBLIC_WS_BASE = "https://jameson-nondiscriminative-zaiden.ngrok-free.dev"
+PUBLIC_WS_BASE = "https://jameson-nondiscriminative-zaiden.ngrok-free.dev"
 
 
 
@@ -68,7 +68,10 @@ async def initiate_schedule_call(payload: ScheduleCallRequest):
             ctx = {
                 "ticketId": payload.ticketId,
                 "callbackUrl": str(payload.callbackUrl),
+                "serviceTag": str(payload.serviceTag).strip(),
+                "serviceTagConfirmed": None,
                 "address": summarize_address_for_speech(payload.address),
+                "pincode": getattr(payload, "pincode", None),
                 "availableDates": payload.availableDates,
                 "callConnected": True,
                 "isLineBusy": False,
@@ -81,6 +84,9 @@ async def initiate_schedule_call(payload: ScheduleCallRequest):
                 "last_assistant_message": "",
                 "status": "active",
                 "isReschedule": False,
+                "slotTier": None,
+                "proximityRejected": False,
+                "confirmedOfferDate": None,
             }
             call_context[call_sid] = ctx
             call_context[f"ticket:{str(payload.ticketId).strip()}"] = ctx
@@ -103,7 +109,10 @@ async def prepare_inbound_call(payload: PrepareInboundCallRequest):
     ctx = {
         "ticketId": payload.ticketId,
         "callbackUrl": str(payload.callbackUrl),
+        "serviceTag": str(getattr(payload, "serviceTag", "") or "").strip(),
+        "serviceTagConfirmed": None,
         "address": summarize_address_for_speech(payload.address),
+        "pincode": getattr(payload, "pincode", None),
         "availableDates": payload.availableDates,
         "callConnected": True,
         "isLineBusy": False,
@@ -118,6 +127,9 @@ async def prepare_inbound_call(payload: PrepareInboundCallRequest):
         "isReschedule": False,
         "inbound": True,
         "customerPhone": payload.customerPhone,
+        "slotTier": None,
+        "proximityRejected": False,
+        "confirmedOfferDate": None,
     }
     call_context[call_sid] = ctx
     call_context[f"ticket:{ticket_id}"] = ctx
@@ -167,9 +179,10 @@ async def handle_media_stream(websocket: WebSocket):
                
                 logger.info(f"Exotel stream started: {stream_sid}")
                
-                openai_ws = await connect_to_openai(stream_sid, person_name)
                 sender_tasks[stream_sid] = asyncio.create_task(paced_audio_sender(stream_sid))
-                asyncio.create_task(handle_openai_responses(stream_sid, openai_ws))
+                openai_ws = await start_voice_session(stream_sid, person_name)
+                if openai_ws is not None:
+                    asyncio.create_task(handle_openai_responses(stream_sid, openai_ws))
  
             elif event == 'media' and stream_sid:
                 await handle_exotel_media(stream_sid, data)
