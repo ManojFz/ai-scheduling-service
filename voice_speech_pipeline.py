@@ -120,6 +120,26 @@ def _user_spoke_since_listen_start(stream_sid: str) -> bool:
     return last_speech > listen_start + 0.05
 
 
+def _user_active_since(stream_sid: str, ts: float) -> bool:
+    """True if any user speech was recognized after `ts` — including speech that
+    arrived while the listen gate was closed (dropped by half-duplex). A customer
+    who spoke during bot playback is present and must not be hung up on."""
+    sess = speech_sessions.get(stream_sid)
+    if not sess:
+        return False
+    last = max(
+        float(sess.get("last_user_speech_at") or 0),
+        float(sess.get("last_user_activity_at") or 0),
+    )
+    return last > ts + 0.05
+
+
+def _mark_user_activity(stream_sid: str) -> None:
+    sess = speech_sessions.get(stream_sid)
+    if sess:
+        sess["last_user_activity_at"] = time.time()
+
+
 async def _wait_tts_gen_playback(stream_sid: str, gen: int) -> None:
     """Block until TTS `gen` has finished playing (or session ended)."""
     deadline = time.time() + 60.0
@@ -242,13 +262,27 @@ async def _silence_hangup(stream_sid: str) -> None:
     asyncio.create_task(_svc.cleanup_after_playback(stream_sid))
 
 
+def _reschedule_after_activity(stream_sid: str, gen: int) -> None:
+    """Re-arm the silence watchdog when we skipped a hangup because of user
+    activity that was dropped by the listen gate (no bot turn was started for
+    it). Without this the call would sit in dead air with no watchdog. If a
+    real turn is in flight (bot speaking / listening closed), its playback
+    completion will schedule a fresh watchdog, so do nothing here."""
+    if not _session_alive_for_silence(stream_sid, gen):
+        return
+    sess = speech_sessions.get(stream_sid)
+    if not sess or sess.get("bot_speaking") or not sess.get("listening_enabled"):
+        return
+    schedule_listening_silence_watchdog(stream_sid)
+
+
 async def _listening_silence_watchdog(stream_sid: str, gen: int) -> None:
     listen_start = time.time()
     try:
         await asyncio.sleep(SILENCE_NUDGE_SECONDS)
         if not _session_alive_for_silence(stream_sid, gen):
             return
-        if _user_spoke_since_listen_start(stream_sid):
+        if _user_spoke_since_listen_start(stream_sid) or _user_active_since(stream_sid, listen_start):
             logger.info("Silence nudge skipped — user spoke stream=%s", stream_sid)
             return
         if not _watchdog_still_valid(stream_sid, gen):
@@ -257,6 +291,7 @@ async def _listening_silence_watchdog(stream_sid: str, gen: int) -> None:
             if (
                 not _session_alive_for_silence(stream_sid, gen)
                 or _user_spoke_since_listen_start(stream_sid)
+                or _user_active_since(stream_sid, listen_start)
                 or not _watchdog_still_valid(stream_sid, gen)
             ):
                 return
@@ -268,26 +303,31 @@ async def _listening_silence_watchdog(stream_sid: str, gen: int) -> None:
 
         if not _session_alive_for_silence(stream_sid, gen):
             return
-        if _user_spoke_since_listen_start(stream_sid):
+        if _user_spoke_since_listen_start(stream_sid) or _user_active_since(stream_sid, listen_start):
             logger.info("Silence hangup skipped — user spoke after nudge stream=%s", stream_sid)
+            _reschedule_after_activity(stream_sid, gen)
             return
 
-        # Keep listening open for the remainder of the 15s window (from original listen start)
-        elapsed = time.time() - listen_start
-        wait_more = max(0.5, SILENCE_HANGUP_SECONDS - elapsed)
+        # Give the customer a FRESH answer window measured from when the nudge
+        # finished playing — never "whatever is left" of the original window,
+        # because the nudge itself (repeating a long date list) eats that time.
+        answer_window = max(5.0, SILENCE_HANGUP_SECONDS - SILENCE_NUDGE_SECONDS)
+        nudge_done_at = time.time()
         logger.info(
-            "Silence hangup wait stream=%s remaining=%.1fs (total=%ss)",
+            "Silence hangup wait stream=%s window=%.1fs after nudge",
             stream_sid,
-            wait_more,
-            SILENCE_HANGUP_SECONDS,
+            answer_window,
         )
-        await asyncio.sleep(wait_more)
-
-        if not _session_alive_for_silence(stream_sid, gen):
-            return
-        if _user_spoke_since_listen_start(stream_sid):
-            logger.info("Silence hangup skipped — user spoke stream=%s", stream_sid)
-            return
+        while time.time() - nudge_done_at < answer_window:
+            await asyncio.sleep(0.25)
+            if not _session_alive_for_silence(stream_sid, gen):
+                return
+            if _user_spoke_since_listen_start(stream_sid) or _user_active_since(
+                stream_sid, listen_start
+            ):
+                logger.info("Silence hangup skipped — user spoke stream=%s", stream_sid)
+                _reschedule_after_activity(stream_sid, gen)
+                return
 
         await _silence_hangup(stream_sid)
     except asyncio.CancelledError:
@@ -334,10 +374,23 @@ def _speech_config() -> "speechsdk.SpeechConfig":
     return cfg
 
 
-def _pick_tts_voice(text: str) -> str:
-    if re.search(r"[\u0C80-\u0CFF]", text):
+def _pick_tts_voice(stream_sid: Optional[str] = None, text: str = "") -> str:
+    """Prefer locked call language so TTS voice does not flip with Nano script mixups."""
+    lang = None
+    if stream_sid and _svc is not None:
+        try:
+            lang = _svc.detect_locked_language(stream_sid)
+        except Exception:
+            lang = None
+    if lang == "kn":
         return AZURE_SPEECH_VOICE_KN
-    if re.search(r"[\u0900-\u097F]", text):
+    if lang == "hi":
+        return AZURE_SPEECH_VOICE_HI
+    if lang == "en":
+        return AZURE_SPEECH_VOICE
+    if re.search(r"[\u0C80-\u0CFF]", text or ""):
+        return AZURE_SPEECH_VOICE_KN
+    if re.search(r"[\u0900-\u097F]", text or ""):
         return AZURE_SPEECH_VOICE_HI
     return AZURE_SPEECH_VOICE
 
@@ -404,6 +457,7 @@ async def start_speech_session(stream_sid: str, system_message: str) -> None:
         "silence_gen": 0,
         "listen_started_at": 0.0,
         "last_user_speech_at": 0.0,
+        "last_user_activity_at": 0.0,
         "silence_nudged": False,
         "playback_done_events": {},
         "turn_lock": asyncio.Lock(),
@@ -425,6 +479,9 @@ async def start_speech_session(stream_sid: str, system_message: str) -> None:
         if not sess or sess.get("closed"):
             return
         if sess.get("bot_speaking") or not sess.get("listening_enabled"):
+            # Still counts as presence — never silence-hangup on a customer
+            # whose answer arrived while the bot was talking.
+            _mark_user_activity(stream_sid)
             logger.info(
                 "Ignored STT while bot speaking/not listening: %r for stream %s",
                 text,
@@ -468,6 +525,7 @@ async def _on_user_utterance(stream_sid: str, transcript: str) -> None:
     if not sess or sess.get("closed"):
         return
     if sess.get("bot_speaking") or not sess.get("listening_enabled"):
+        _mark_user_activity(stream_sid)
         logger.info(
             "Dropped late STT after listen gate closed: %r stream %s",
             transcript,
@@ -526,10 +584,11 @@ async def inject_and_respond(stream_sid: str, user_text: str) -> None:
 
         reply = _svc.correct_assistant_slot_confirmation(stream_sid, reply)
         reply = _svc.correct_assistant_date_confirmation(stream_sid, reply)
+        reply = _svc.align_confirm_reply_to_locked_language(stream_sid, reply)
         reply = _svc.guard_booking_confirmed_reply(stream_sid, reply)
 
-        if _svc.is_incomplete_scheduling_filler(reply):
-            # Do not speak the filler; force a full date/slot list turn.
+        if _svc.should_force_step2_continuation(stream_sid, reply):
+            # Do not speak thanks-only / hold filler; force dates or slots in same turn.
             reply = await _svc.rewrite_incomplete_filler_reply(
                 stream_sid, sess["history"], reply
             )
@@ -566,7 +625,7 @@ async def _synthesize_and_queue(
         _cancel_silence_watchdog(stream_sid)
     _disable_listening(stream_sid)
 
-    voice = _pick_tts_voice(text)
+    voice = _pick_tts_voice(stream_sid, text)
     gen = int(sess.get("tts_gen", 0)) + 1
     sess["tts_gen"] = gen
     sess["bot_speaking"] = True
