@@ -65,7 +65,7 @@ def _reload_speech_env() -> None:
 
 
 GREETING_USER_PROMPT = (
-    "(The phone call has just connected. Begin immediately with Step 0a, then Step 0b, then Step 0c "
+    "(The phone call has just connected. Begin immediately with Step 0a, then Step 0b "
     "from the script. Do not wait for the customer to speak first. Do not skip any opening step.)"
 )
 
@@ -505,7 +505,8 @@ async def start_speech_session(stream_sid: str, system_message: str) -> None:
 
     logger.info("Speech session started for stream %s — triggering greeting", stream_sid)
     # Do not await: keep Exotel WS receive loop free while Nano+TTS run.
-    asyncio.create_task(inject_and_respond(stream_sid, GREETING_USER_PROMPT))
+    greeting = _svc.greeting_user_prompt_for_stream(stream_sid)
+    asyncio.create_task(inject_and_respond(stream_sid, greeting))
 
 
 async def feed_pcm_audio(stream_sid: str, pcm_bytes: bytes) -> None:
@@ -570,6 +571,27 @@ async def inject_and_respond(stream_sid: str, user_text: str) -> None:
 
         _disable_listening(stream_sid)
 
+        # Slot step + unmapped STT (e.g. "2122") → re-list slots; never ask yes/no.
+        if _svc.should_deterministic_unclear_slot_reask(stream_sid, user_text):
+            reply = _svc.build_unclear_slot_reask(stream_sid)
+            sess["history"].append(HumanMessage(content=user_text))
+            sess["history"].append(AIMessage(content=reply))
+            if stream_sid in _svc.call_context:
+                _svc.call_context[stream_sid]["last_assistant_message"] = reply
+            logger.info(
+                "Deterministic unclear-slot reask stream=%s user=%r → %r",
+                stream_sid,
+                user_text,
+                reply,
+            )
+            speakable = split_speakable_text(reply)
+            if speakable:
+                await _synthesize_and_queue(stream_sid, speakable)
+            else:
+                _enable_listening(stream_sid)
+                schedule_listening_silence_watchdog(stream_sid)
+            return
+
         sess["history"].append(HumanMessage(content=user_text))
         try:
             ai_msg = await _svc.conversation_llm.ainvoke(sess["history"])
@@ -586,6 +608,17 @@ async def inject_and_respond(stream_sid: str, user_text: str) -> None:
         reply = _svc.correct_assistant_date_confirmation(stream_sid, reply)
         reply = _svc.align_confirm_reply_to_locked_language(stream_sid, reply)
         reply = _svc.guard_booking_confirmed_reply(stream_sid, reply)
+
+        # Safety net: Nano asked yes/no about slot instead of re-listing
+        if _svc.is_in_slot_selection_step(stream_sid) and _svc.is_slot_yes_no_misclarification(
+            reply
+        ):
+            logger.warning(
+                "Rewriting slot yes/no misclarification stream=%s was=%r",
+                stream_sid,
+                reply,
+            )
+            reply = _svc.build_unclear_slot_reask(stream_sid)
 
         if _svc.should_force_step2_continuation(stream_sid, reply):
             # Do not speak thanks-only / hold filler; force dates or slots in same turn.

@@ -228,6 +228,9 @@ def link_stream_sid_to_call_context(
         "serviceTag": "",
         "serviceTagConfirmed": None,
         "address": "",
+        "ticketState": None,
+        "allowedLanguages": ["en", "hi", "kn"],
+        "skipLanguageSelection": False,
         "availableDates": [],
         "addressConfirmed": None,
         "last_assistant_message": "",
@@ -314,18 +317,154 @@ BOOKING_CONFIRMED_GOODBYE_HI = "अपॉइंटमेंट कन्फर�
 BOOKING_CONFIRMED_GOODBYE_KN = "ನಿಮ್ಮ ಅಪಾಯಿಂಟ್‌ಮೆಂಟ್ ದೃಢಪಡಿಸಿದ್ದಕ್ಕೆ ಧನ್ಯವಾದಗಳು. ಬೈ."
 
 
+_STATE_LABEL_IN_ADDRESS_RE = re.compile(
+    r"(?:,\s*)?State\s*:\s*([^,;|]+)",
+    re.IGNORECASE,
+)
+
+
+def extract_ticket_state_from_address(address: Optional[str]) -> tuple[Optional[str], str]:
+    """
+    Pull labeled ``State: …`` (Tata converse payload) out of address.
+    Returns (state_or_None, address_with_state_marker_removed).
+    """
+    raw = "" if address is None else str(address).strip()
+    if not raw:
+        return None, ""
+    m = _STATE_LABEL_IN_ADDRESS_RE.search(raw)
+    if not m:
+        return None, raw
+    state = (m.group(1) or "").strip() or None
+    cleaned = (_STATE_LABEL_IN_ADDRESS_RE.sub("", raw)).strip(" ,;")
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" ,;")
+    return state, cleaned
+
+
+def normalize_state_key(state: Optional[str]) -> str:
+    return re.sub(r"[^a-z]", "", (state or "").lower())
+
+
+def is_tamil_nadu_state(state: Optional[str]) -> bool:
+    return normalize_state_key(state) == "tamilnadu"
+
+
+def allowed_languages_for_state(state: Optional[str]) -> List[str]:
+    """
+    Tamil Nadu → English only (no language selection on the call).
+    Karnataka / unknown / empty → English, Hindi, Kannada.
+    """
+    if is_tamil_nadu_state(state):
+        return ["en"]
+    return ["en", "hi", "kn"]
+
+
+def language_offer_phrase(langs: Optional[List[str]] = None) -> str:
+    codes = langs or ["en", "hi", "kn"]
+    names = [locked_language_display_name(c) for c in codes]
+    if len(names) <= 1:
+        return names[0] if names else "English"
+    if len(names) == 2:
+        return f"{names[0]} or {names[1]}"
+    return f"{', '.join(names[:-1])}, or {names[-1]}"
+
+
+def get_allowed_languages(stream_sid: Optional[str] = None) -> List[str]:
+    if stream_sid and stream_sid in call_context:
+        langs = call_context[stream_sid].get("allowedLanguages")
+        if isinstance(langs, list) and langs:
+            return [str(x).lower() for x in langs]
+    return ["en", "hi", "kn"]
+
+
+def skip_language_selection(stream_sid: Optional[str] = None) -> bool:
+    if stream_sid and stream_sid in call_context:
+        return bool(call_context[stream_sid].get("skipLanguageSelection"))
+    return False
+
+
+def build_language_fields_from_address(address: Optional[str]) -> Dict[str, Any]:
+    """State + allowed langs + speech-safe address (State: marker stripped)."""
+    state, cleaned = extract_ticket_state_from_address(address)
+    langs = allowed_languages_for_state(state)
+    tn_english_only = is_tamil_nadu_state(state)
+    fields: Dict[str, Any] = {
+        "ticketState": state,
+        "allowedLanguages": langs,
+        "skipLanguageSelection": tn_english_only,
+        "address": summarize_address_for_speech(cleaned if cleaned else (address or "")),
+    }
+    # Tamil Nadu: pre-lock English so the bot never asks for language.
+    if tn_english_only:
+        fields["lockedLanguage"] = "en"
+    return fields
+
+
+_OPENING_FLOW_NORMAL = """OPENING AND LANGUAGE SELECTION:
+At the start of the conversation, speak Step 0a and Step 0b in English first, in order, before asking for language.
+Then ask the customer to select their preferred language from: {{language_options}}.
+Offer ONLY the languages listed in {{language_options}} — do not mention or accept any other language.
+If the input is unclear, background noise, or not one of the supported languages, DO NOT auto-select.
+Politely ask the customer to repeat:
+👉 “I’m sorry, I didn’t catch that. Could you please say {{language_options}}?”
+Once a supported language from {{language_options}} is clearly detected, lock in that language immediately and proceed to Step 1 — do NOT ask “You selected [Language]. Is that correct?” or any other confirmation.
+Do not proceed to Step 1 until a supported language is clearly detected."""
+
+_OPENING_FLOW_TAMIL_NADU = """OPENING (Tamil Nadu — English only):
+Language is already locked to English for this call. Do NOT ask the customer to choose a language. Do NOT mention Hindi, Kannada, or any language options.
+At the start, speak Step 0a (intro) in English, then immediately go to Step 1 (service tag confirmation) in English — in the same opening turn is preferred.
+Never ask “Please choose English…” or any language question."""
+
+_STEP0_FLOW_NORMAL = """Step 0 (OPENING — speak in this exact order before anything else)
+
+Step 0a (INTRO — always speak in English):
+👉 “Hello, This is Dell Scheduling.
+This call is recorded.”
+
+Step 0b (LANGUAGE SELECTION — after Step 0a):
+👉 “Please choose {{language_options}}.”
+If unclear/noise/invalid → repeat the language request only (do not repeat 0a unless the call restarted).
+Once a supported language from {{language_options}} is clearly detected → lock it in immediately and proceed to Step 1. Do NOT confirm with “You selected [Language]. Is that correct?”
+
+Step 1 (SERVICE TAG CONFIRMATION)
+Immediately after language is locked in, speak **in the customer’s selected language** using this structure:"""
+
+_STEP0_FLOW_TAMIL_NADU = """Step 0 (OPENING — Tamil Nadu English-only; no language selection)
+
+Step 0a (INTRO — English only):
+👉 “Hello, This is Dell Scheduling.
+This call is recorded.”
+Do NOT ask for language. Immediately continue to Step 1 after this intro.
+
+Step 1 (SERVICE TAG CONFIRMATION)
+Immediately after Step 0a, speak in English using this structure:"""
+
+
+def greeting_user_prompt_for_stream(stream_sid: str) -> str:
+    if skip_language_selection(stream_sid):
+        return (
+            "(The phone call has just connected. Language is already English for Tamil Nadu. "
+            "Begin immediately with Step 0a intro, then Step 1 service tag confirmation in English. "
+            "Do NOT ask for language. Do not wait for the customer to speak first.)"
+        )
+    return (
+        "(The phone call has just connected. Begin immediately with Step 0a, then Step 0b "
+        "from the script. Do not wait for the customer to speak first. Do not skip any opening step.)"
+    )
+
+
 def detect_locked_language(stream_sid: Optional[str] = None, text: str = "") -> str:
     """Return 'en' | 'hi' | 'kn' from context; text script is fallback only if unlocked."""
+    allowed = get_allowed_languages(stream_sid)
     if stream_sid and stream_sid in call_context:
         locked = (call_context[stream_sid].get("lockedLanguage") or "").strip().lower()
-        if locked in ("en", "hi", "kn"):
+        if locked in ("en", "hi", "kn") and locked in allowed:
             return locked
     sample = text or ""
-    if re.search(r"[\u0C80-\u0CFF]", sample):
+    if re.search(r"[\u0C80-\u0CFF]", sample) and "kn" in allowed:
         return "kn"
-    if re.search(r"[\u0900-\u097F]", sample):
+    if re.search(r"[\u0900-\u097F]", sample) and "hi" in allowed:
         return "hi"
-    return "en"
+    return "en" if "en" in allowed else (allowed[0] if allowed else "en")
 
 
 def locked_language_display_name(lang: str) -> str:
@@ -358,15 +497,32 @@ def parse_language_choice(transcript: str) -> Optional[str]:
 
 def maybe_lock_language_from_transcript(stream_sid: str, transcript: str) -> None:
     """
-    Lock or switch language when the customer clearly names English / Hindi / Kannada.
+    Lock or switch language when the customer clearly names an allowed language.
     Explicit switch mid-call is allowed so lock stays in sync with what the customer wants.
+    Tamil Nadu skips language selection (English pre-locked) — ignore switch attempts.
     """
     if not transcript or stream_sid not in call_context:
+        return
+    ctx = call_context[stream_sid]
+    if ctx.get("skipLanguageSelection"):
+        # Keep English; do not re-open language selection mid-call.
+        if not (ctx.get("lockedLanguage") or "").strip():
+            ctx["lockedLanguage"] = "en"
         return
     choice = parse_language_choice(transcript)
     if not choice:
         return
-    ctx = call_context[stream_sid]
+    allowed = get_allowed_languages(stream_sid)
+    if choice not in allowed:
+        logger.info(
+            "Language choice blocked stream=%s choice=%s state=%s allowed=%s (transcript=%r)",
+            stream_sid,
+            choice,
+            ctx.get("ticketState"),
+            allowed,
+            transcript,
+        )
+        return
     prev = (ctx.get("lockedLanguage") or "").strip().lower()
     if prev == choice:
         return
@@ -426,14 +582,14 @@ def format_date_for_speech(date_str: str, lang: str = "en") -> str:
 
 
 def format_selected_confirm(spoken_value: str, lang: str = "en") -> str:
-    """Aligned confirm line across languages: You selected X. Is that correct?"""
+    """Aligned confirm line across languages: You chose X. Correct?"""
     spoken_value = (spoken_value or "").strip()
     lang = (lang or "en").lower()
     if lang == "hi":
         return f"आपने {spoken_value} चुना है। क्या यह सही है?"
     if lang == "kn":
         return f"ನೀವು {spoken_value} ಆಯ್ಕೆ ಮಾಡಿದ್ದೀರಿ. ಇದು ಸರಿಯೇ?"
-    return f"You selected {spoken_value}. Is that correct?"
+    return f"You chose {spoken_value}. Correct?"
 
 
 def booking_confirmed_goodbye(lang: str = "en") -> str:
@@ -589,7 +745,63 @@ def _extract_spoken_hour_pair(text: str) -> Optional[tuple[int, int]]:
         a, b = int(m3.group(1)), int(m3.group(3))
         if 1 <= a <= 12 and 1 <= b <= 12:
             return a, b
+
+    # Glued STT with no separator: "122" / "2122" → try hour pairs (resolved vs slots later)
+    glued = _glued_digit_hour_pairs(t)
+    if glued:
+        return glued[0]
     return None
+
+
+def _glued_digit_hour_pairs(text: str) -> List[tuple[int, int]]:
+    """
+    STT often glues slot speech: '12 to 2' → '122' / '2122', '12pm2pm' → digits only.
+    Return candidate (start, end) hour pairs in 1–12 form.
+    """
+    pairs: List[tuple[int, int]] = []
+    # Keep digit runs; also strip am/pm so '12pm2' → '122'
+    cleaned = re.sub(r"(?:a\.?m\.?|p\.?m\.?)", "", (text or "").lower())
+    cleaned = re.sub(r"[^0-9\s]", " ", cleaned)
+    for m in re.finditer(r"\d{2,5}", cleaned):
+        digits = m.group(0)
+        n = len(digits)
+        # Direct splits into two 1–2 digit hours: "122" → (12,2), "1224" → (12,24) skip
+        for i in range(1, n):
+            left, right = digits[:i], digits[i:]
+            if len(left) > 2 or len(right) > 2:
+                continue
+            if left.startswith("0") or right.startswith("0"):
+                continue
+            a, b = int(left), int(right)
+            if 1 <= a <= 12 and 1 <= b <= 12:
+                pairs.append((a, b))
+        # Substring scan: "2122" → finds (12, 2) even with a leading noise digit
+        for i in range(n):
+            for j in range(i + 1, min(i + 3, n + 1)):
+                left = digits[i:j]
+                if left.startswith("0"):
+                    continue
+                a = int(left)
+                if not (1 <= a <= 12):
+                    continue
+                for k in range(j, n):
+                    for m2 in range(k + 1, min(k + 3, n + 1)):
+                        right = digits[k:m2]
+                        if right.startswith("0"):
+                            continue
+                        b = int(right)
+                        if 1 <= b <= 12:
+                            pairs.append((a, b))
+    # Prefer pairs that look like a real window (start != end); keep order, de-dupe
+    seen = set()
+    out: List[tuple[int, int]] = []
+    for p in pairs:
+        if p[0] == p[1]:
+            continue
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
 
 
 def _slot_start_end_hours(raw: str) -> Optional[tuple[int, int]]:
@@ -629,6 +841,7 @@ def _candidate_hour_pairs_from_text(text: str) -> List[tuple[int, int]]:
     primary = _extract_spoken_hour_pair(text)
     if primary:
         pairs.append(primary)
+    pairs.extend(_glued_digit_hour_pairs(text))
 
     t = normalize_kannada_phonetic_english(text or "").lower()
     t = t.replace("–", "-").replace("—", "-").replace("−", "-")
@@ -695,7 +908,7 @@ def match_spoken_slot_to_canonical(transcript: str, available_slots: List[str]) 
 
 
 _SLOT_CONFIRM_Q_RE = re.compile(
-    r"is that correct|क्या (यह|ये) सही|ಸರಿಯ[ೇೆ]|ಸರಿಯಾಗಿದೆ",
+    r"is that correct|\bcorrect\?|क्या (यह|ये) सही|ಸರಿಯ[ೇೆ]|ಸರಿಯಾಗಿದೆ",
     re.I,
 )
 
@@ -706,6 +919,20 @@ def remember_pending_slot_from_text(stream_sid: str, text: str) -> Optional[str]
         return None
     ctx = call_context[stream_sid]
     available = collect_available_slots_for_context(ctx)
+    # When no date yet, search across all dates so unique slots can still be mapped
+    if not available or not ctx.get("pendingSelectedDate"):
+        all_slots: List[str] = []
+        for row in _iter_date_tier_rows(ctx.get("availableDates") or []):
+            for s in (
+                row.get("standardSlots")
+                or row.get("slots")
+                or row.get("proximitySlots")
+                or []
+            ):
+                if s not in all_slots:
+                    all_slots.append(s)
+        if all_slots:
+            available = all_slots
     canon = match_spoken_slot_to_canonical(text, available)
     if not canon:
         return None
@@ -715,8 +942,11 @@ def remember_pending_slot_from_text(stream_sid: str, text: str) -> Optional[str]
         rows = _iter_date_tier_rows(ctx.get("availableDates") or [])
         if len(rows) == 1 and rows[0].get("date"):
             ctx["pendingSelectedDate"] = rows[0]["date"]
+            ctx["confirmedOfferDate"] = rows[0]["date"]
         elif ctx.get("confirmedOfferDate"):
             ctx["pendingSelectedDate"] = ctx.get("confirmedOfferDate")
+        else:
+            maybe_infer_pending_date_from_slot(stream_sid)
     if prev != canon:
         logger.info(
             "Remembered pending slot stream=%s from text → %s",
@@ -724,6 +954,84 @@ def remember_pending_slot_from_text(stream_sid: str, text: str) -> Optional[str]
             canon,
         )
     return canon
+
+
+def _normalize_slot_key(raw: str) -> str:
+    return re.sub(r"[–—‒−]", "-", str(raw or "").strip())
+
+
+def dates_containing_slot(context: Dict[str, Any], canonical_slot: str) -> List[str]:
+    """Return YYYY-MM-DD rows that include this canonical slot."""
+    target = _normalize_slot_key(canonical_slot)
+    if not target:
+        return []
+    out: List[str] = []
+    for row in _iter_date_tier_rows(context.get("availableDates") or []):
+        d = row.get("date")
+        if not d:
+            continue
+        slots = (
+            row.get("standardSlots")
+            or row.get("slots")
+            or row.get("proximitySlots")
+            or []
+        )
+        for s in slots:
+            if _normalize_slot_key(s) == target:
+                out.append(str(d).replace(":", "-")[:10])
+                break
+    return out
+
+
+def maybe_infer_pending_date_from_slot(stream_sid: str) -> Optional[str]:
+    """
+    If a pending slot exists on exactly one available date, lock that date.
+    Avoids the CONFIRMED hangup loop when Nano skipped date selection.
+    """
+    if stream_sid not in call_context:
+        return None
+    ctx = call_context[stream_sid]
+    if ctx.get("pendingSelectedDate") or ctx.get("confirmedOfferDate") or ctx.get("selectedDate"):
+        return (
+            ctx.get("pendingSelectedDate")
+            or ctx.get("confirmedOfferDate")
+            or ctx.get("selectedDate")
+        )
+    slot = ctx.get("pendingSelectedSlot") or ctx.get("selectedSlot")
+    if not slot:
+        return None
+    dates = dates_containing_slot(ctx, str(slot))
+    if len(dates) != 1:
+        return None
+    ctx["pendingSelectedDate"] = dates[0]
+    ctx["confirmedOfferDate"] = dates[0]
+    logger.info(
+        "Inferred pending date stream=%s from unique slot %s → %s",
+        stream_sid,
+        slot,
+        dates[0],
+    )
+    return dates[0]
+
+
+def build_date_choice_prompt(stream_sid: str, *, with_great: bool = False) -> str:
+    """Re-ask appointment dates when multi-date flow skipped date selection."""
+    ctx = call_context.get(stream_sid) or {}
+    lang = detect_locked_language(stream_sid)
+    spoken_dates = []
+    for row in _iter_date_tier_rows(ctx.get("availableDates") or []):
+        d = row.get("date") or ""
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", d):
+            spoken_dates.append(format_date_for_speech(d, lang))
+    dates_line = ", ".join(spoken_dates) if spoken_dates else "the available dates"
+    if lang == "hi":
+        body = f"उपलब्ध तारीखें हैं {dates_line} या रीशेड्यूल।"
+        return f"बहुत अच्छा। {body}" if with_great else body
+    if lang == "kn":
+        body = f"ಲಭ್ಯವಿರುವ ದಿನಾಂಕಗಳು {dates_line} ಅಥವಾ ಮರುನಿಗದಿ."
+        return f"ಚೆನ್ನಾಗಿದೆ. {body}" if with_great else body
+    body = f"Available dates are {dates_line} or reschedule."
+    return f"Great. {body}" if with_great else body
 
 
 def build_slot_choice_prompt(stream_sid: str) -> str:
@@ -743,21 +1051,119 @@ def build_slot_choice_prompt(stream_sid: str) -> str:
     return f"Please choose one of the available slots: {slots_line}."
 
 
+def build_unclear_slot_reask(stream_sid: str) -> str:
+    """When STT is garbled at slot step — never ask yes/no; re-list slots."""
+    ctx = call_context.get(stream_sid) or {}
+    lang = detect_locked_language(stream_sid)
+    available = collect_available_slots_for_context(ctx)
+    spoken = []
+    for raw in available:
+        cue = _slot_range_payload_to_spoken_cue(raw) or raw
+        spoken.append(cue)
+    slots_line = ", ".join(spoken) if spoken else "the available times"
+    if lang == "hi":
+        return (
+            f"माफ़ कीजिए, मुझे साफ़ सुनाई नहीं दिया। उपलब्ध स्लॉट हैं: {slots_line}। "
+            f"कृपया एक चुनें।"
+        )
+    if lang == "kn":
+        return (
+            f"ಕ್ಷಮಿಸಿ, ಸ್ಪಷ್ಟವಾಗಿ ಕೇಳಿಸಲಿಲ್ಲ. ಲಭ್ಯವಿರುವ ಸ್ಲಾಟ್‌ಗಳು: {slots_line}. "
+            f"ದಯವಿಟ್ಟು ಒಂದನ್ನು ಆಯ್ಕೆ ಮಾಡಿ."
+        )
+    return (
+        f"Sorry, I didn't catch that. Available slots are: {slots_line}. "
+        f"Please choose one."
+    )
+
+
+def is_in_slot_selection_step(stream_sid: str) -> bool:
+    """True after date is locked (or single-date mode) and booking not finished."""
+    if stream_sid not in call_context:
+        return False
+    ctx = call_context[stream_sid]
+    if ctx.get("serviceTagConfirmed") is not True:
+        return False
+    if ctx.get("slotSelected") or ctx.get("pending_hangup") or ctx.get("status") == "closing":
+        return False
+    if ctx.get("isReschedule"):
+        return False
+    rows = _iter_date_tier_rows(ctx.get("availableDates") or [])
+    if not rows:
+        return False
+    has_date = bool(
+        ctx.get("pendingSelectedDate")
+        or ctx.get("confirmedOfferDate")
+        or ctx.get("selectedDate")
+        or len(rows) == 1
+    )
+    return has_date
+
+
+def is_slot_yes_no_misclarification(reply: str) -> bool:
+    """Nano wrongly reused service-tag yes/no wording during slot selection."""
+    if not reply:
+        return False
+    return bool(
+        re.search(
+            r"say yes if (?:the )?slot is correct|"
+            r"please say yes if (?:the )?(?:slot|time)|"
+            r"slot is correct,? or no|"
+            r"स्लॉट सही हो तो हाँ|"
+            r"ಸ್ಲಾಟ್ ಸರಿಯಾಗಿದ್ದರೆ ಹೌದು",
+            reply,
+            re.I,
+        )
+    )
+
+
+def should_deterministic_unclear_slot_reask(stream_sid: str, transcript: str) -> bool:
+    """
+    At slot-selection step, if we cannot map the utterance to a listed slot
+    and it is not a clear yes/no on a pending slot-confirm, force slot re-list.
+    """
+    if not transcript or not is_in_slot_selection_step(stream_sid):
+        return False
+    ctx = call_context[stream_sid]
+    last = ctx.get("last_assistant_message") or ""
+    yn = _classify_yes_no_confirmation(transcript)
+    # Clear yes/no while confirming an already-proposed slot → let normal flow run
+    if yn and _SLOT_CONFIRM_Q_RE.search(last):
+        return False
+    # Reschedule / language switch — not a slot pick
+    if re.search(r"\breschedule\b|रीशेड्यूल|ಮರುನಿಗದಿ", transcript, re.I):
+        return False
+    if parse_language_choice(transcript):
+        return False
+    available = collect_available_slots_for_context(ctx)
+    if not available:
+        return False
+    normalized = normalize_kannada_phonetic_english(transcript)
+    if match_spoken_slot_to_canonical(normalized, available):
+        return False
+    if match_spoken_slot_to_canonical(transcript, available):
+        return False
+    return True
+
+
 def guard_booking_confirmed_reply(stream_sid: str, reply: str) -> str:
     """
     Normalize final goodbye only when date+slot are both pending.
-    If Nano tries to CONFIRMED without a mapped slot, re-ask for a slot instead.
+    Missing date on multi-date → re-ask dates (never dump all slots again).
+    Unique-slot → infer date when possible.
     """
     if not reply or stream_sid not in call_context:
         return reply
     if re.search(r"\b(DECLINE|DECLINED|DECLINING)\b", reply, re.I):
         return reply
 
-    # Capture slot from Nano's confirm line before deciding
+    # Capture slot from Nano's confirm / goodbye line before deciding
     if _SLOT_CONFIRM_Q_RE.search(reply) and re.search(
         r"\b(selected|choose|chose|आपने|ಆಯ್ಕೆ)\b", reply, re.I
     ):
         remember_pending_slot_from_text(stream_sid, reply)
+    remember_pending_slot_from_text(stream_sid, reply)
+    maybe_infer_pending_date_from_slot(stream_sid)
 
     looks_final = bool(
         re.search(r"\bCONFIRMED\b", reply, re.I)
@@ -767,25 +1173,39 @@ def guard_booking_confirmed_reply(stream_sid: str, reply: str) -> str:
         return reply
 
     ctx = call_context[stream_sid]
+    rows = _iter_date_tier_rows(ctx.get("availableDates") or [])
+    if (
+        not (
+            ctx.get("pendingSelectedDate")
+            or ctx.get("confirmedOfferDate")
+            or ctx.get("selectedDate")
+        )
+        and len(rows) == 1
+        and rows[0].get("date")
+    ):
+        ctx["pendingSelectedDate"] = rows[0]["date"]
+        ctx["confirmedOfferDate"] = rows[0]["date"]
+
     date = ctx.get("pendingSelectedDate") or ctx.get("confirmedOfferDate") or ctx.get("selectedDate")
     slot = ctx.get("pendingSelectedSlot") or ctx.get("selectedSlot")
     if date and slot:
         return normalize_confirmed_goodbye(reply, stream_sid)
 
-    if date and not slot:
-        ask = build_slot_choice_prompt(stream_sid)
+    if not date:
+        ask = build_date_choice_prompt(stream_sid, with_great=False)
         logger.warning(
-            "Blocked premature CONFIRMED goodbye stream=%s date=%s (no pending slot) → re-ask slots",
+            "Blocked premature CONFIRMED goodbye stream=%s (no pending date) → re-ask dates",
             stream_sid,
-            date,
         )
         return ask
 
+    ask = build_slot_choice_prompt(stream_sid)
     logger.warning(
-        "Blocked premature CONFIRMED goodbye stream=%s (missing date/slot)",
+        "Blocked premature CONFIRMED goodbye stream=%s date=%s (no pending slot) → re-ask slots",
         stream_sid,
+        date,
     )
-    return build_slot_choice_prompt(stream_sid)
+    return ask
 
 
 def collect_available_slots_for_context(context: Dict[str, Any]) -> List[str]:
@@ -878,7 +1298,7 @@ def prepare_user_transcript_for_llm(stream_sid: str, transcript: str) -> str:
             if from_last:
                 ctx["pendingSelectedDate"] = from_last
                 ctx["confirmedOfferDate"] = from_last
-        # Yes after "You selected 1 PM to 3 PM. Is that correct?" → lock that slot
+        # Yes after "You chose 1 PM to 3 PM. Correct?" → lock that slot
         if _SLOT_CONFIRM_Q_RE.search(last):
             remember_pending_slot_from_text(stream_sid, last)
 
@@ -893,8 +1313,11 @@ def prepare_user_transcript_for_llm(stream_sid: str, transcript: str) -> str:
     if not ctx.get("pendingSelectedDate"):
         if len(rows) == 1 and rows[0].get("date"):
             ctx["pendingSelectedDate"] = rows[0]["date"]
+            ctx["confirmedOfferDate"] = rows[0]["date"]
         elif ctx.get("confirmedOfferDate"):
             ctx["pendingSelectedDate"] = ctx.get("confirmedOfferDate")
+        else:
+            maybe_infer_pending_date_from_slot(stream_sid)
 
     enriched = (
         f'{normalized}. '
@@ -935,7 +1358,7 @@ def align_confirm_reply_to_locked_language(stream_sid: str, reply: str) -> str:
     if not reply or stream_sid not in call_context:
         return reply
     if not _SLOT_CONFIRM_Q_RE.search(reply) and not re.search(
-        r"is that correct|क्या (यह|ये) सही|ಸರಿಯ[ೇೆ]",
+        r"is that correct|\bcorrect\?|क्या (यह|ये) सही|ಸರಿಯ[ೇೆ]",
         reply,
         re.I,
     ):
@@ -1003,7 +1426,7 @@ def correct_assistant_slot_confirmation(stream_sid: str, reply: str) -> str:
     if not mentioned or mentioned == pending:
         return reply
     if not re.search(
-        r"\b(selected|choose|chose|is that correct|confirm)\b|क्या (यह|ये) सही|ಸರಿಯ[ೇೆ]|ಸರಿಯಾಗಿದೆ",
+        r"\b(selected|choose|chose|is that correct|confirm)\b|\bcorrect\?|क्या (यह|ये) सही|ಸರಿಯ[ೇೆ]|ಸರಿಯಾಗಿದೆ",
         reply,
         re.I,
     ):
@@ -1028,7 +1451,7 @@ def correct_assistant_date_confirmation(stream_sid: str, reply: str) -> str:
     if re.search(r"\breschedule\b|पुनः\s*शेड्यूल|ಮರುನಿಗದಿ", reply, re.I):
         return reply
     if not re.search(
-        r"is that correct|क्या (यह|ये) सही|ಸರಿಯ[ೇೆ]|ಸರಿಯಾಗಿದೆ",
+        r"is that correct|\bcorrect\?|क्या (यह|ये) सही|ಸರಿಯ[ೇೆ]|ಸರಿಯಾಗಿದೆ",
         reply,
         re.I,
     ):
@@ -1056,7 +1479,7 @@ def correct_assistant_date_confirmation(stream_sid: str, reply: str) -> str:
     if len(reply) > 180:
         return reply
     if not re.search(
-        r"\b(would like|you selected|you chose|selected)\b|आपने|चुना|ಆಯ್ಕೆ|ನೀವು",
+        r"\b(would like|you selected|you chose|selected|chose)\b|आपने|चुना|ಆಯ್ಕೆ|ನೀವು",
         reply,
         re.I,
     ) and not match_spoken_date_to_canonical(reply, date_list):
@@ -1093,7 +1516,8 @@ _SCHEDULING_CONTENT_RE = re.compile(
     r"जानवरी|फरवरी|मार्च|अप्रैल|मई|जून|जुलाई|अगस्त|सितंबर|अक्टूबर|नवंबर|दिसंबर|"
     r"ಜನವರಿ|ಫೆಬ್ರವರಿ|ಮಾರ್ಚ್|ಏಪ್ರಿಲ್|ಮೇ|ಜೂನ್|ಜುಲೈ|ಆಗಸ್ಟ್|ಸೆಪ್ಟೆಂಬರ್|ಅಕ್ಟೋಬರ್|ನವೆಂಬರ್|ಡಿಸೆಂಬರ್|"
     r"reschedule|रीशेड्यूल|ಮರುನಿಗದಿ|"
-    r"time\s+slot|available\s+(?:time\s+)?slots?|"
+    r"time\s+slot|available\s+(?:time\s+)?slots?|available\s+dates?|"
+    r"उपलब्ध\s+तारीख|ಲಭ್ಯವಿರುವ\s+ದಿನಾಂಕ|"
     r"\d{1,2}\s*(?:AM|PM|a\.m\.|p\.m\.)"
     r")\b",
     re.I,
@@ -1103,19 +1527,23 @@ _SERVICE_TAG_THANKS_ONLY_RE = re.compile(
     r"("
     r"thanks?\s+for\s+confirming\s+(?:the\s+)?service\s*tag|"
     r"thank\s+you\s+for\s+confirming\s+(?:the\s+)?service\s*tag|"
+    r"^\s*great\.?\s*$|"
     r"सर्विस\s*टैग\s*(?:कन्फर्म|पुष्टि)|"
-    r"ಸರ್ವೀಸ್\s*ಟ್ಯಾಗ್\s*ದೃಢಪಡಿಸ"
+    r"ಸರ್ವೀಸ್\s*ಟ್ಯಾಗ್\s*ದೃಢಪಡಿಸ|"
+    r"बहुत\s*अच्छा|ಚೆನ್ನಾಗಿದೆ"
     r")",
     re.I,
 )
 
 _FORCE_LIST_DATES_PROMPT = (
-    "(System correction — your previous reply thanked for the service tag or stalled, "
+    "(System correction — your previous reply only said Great / thanks for the service tag or stalled, "
     "but did NOT list appointment dates/slots. "
-    "Reply again NOW in the customer's locked language. In ONE turn: briefly thank them for the service tag if needed, "
-    "then immediately continue Step 2 — list EVERY date (or slots in SINGLE_DATE_MODE) from the canonical schedule "
-    "as month and day only (no year), then offer reschedule when in MULTIPLE_DATE_MODE. "
-    "FORBIDDEN: ending after thanks only; please hold; please wait; hold on; let me check. "
+    "Reply again NOW in the customer's locked language. In ONE turn: say Great (or natural short equivalent), "
+    "then immediately continue Step 2 — MULTIPLE_DATE_MODE: "
+    "'Available dates are [dates] or reschedule.' "
+    "SINGLE_DATE_MODE: 'Available slots are: [slots]. Please choose one.' "
+    "FORBIDDEN: ending after Great/thanks only; please hold; please wait; hold on; let me check; "
+    "'Please choose an appointment date from the following options'. "
     "Do NOT speak the year. Do NOT re-ask the service tag. Do NOT ask about address.)"
 )
 
@@ -1165,7 +1593,7 @@ def is_incomplete_service_tag_ack(stream_sid: str, reply: str) -> bool:
     # Short post-confirm ack with no schedule content (Nano stopped early)
     stripped = re.sub(r"\s+", " ", reply).strip()
     if len(stripped) <= 140 and re.search(
-        r"\b(thank|thanks|धन्यवाद|ಧನ್ಯವಾದ)\b",
+        r"\b(thank|thanks|great|धन्यवाद|ಧನ್ಯವಾದ|अच्छा|ಚೆನ್ನಾಗಿದೆ)\b",
         stripped,
         re.I,
     ):
@@ -1173,15 +1601,86 @@ def is_incomplete_service_tag_ack(stream_sid: str, reply: str) -> bool:
     return False
 
 
+def is_slots_offered_before_date(stream_sid: str, reply: str) -> bool:
+    """
+    True when MULTIPLE_DATE_MODE Nano skipped date selection and listed slots
+    (or asked a slot confirm) before any pendingSelectedDate was locked.
+    """
+    if not reply or stream_sid not in call_context:
+        return False
+    ctx = call_context[stream_sid]
+    if ctx.get("serviceTagConfirmed") is not True:
+        return False
+    if (
+        ctx.get("pendingSelectedDate")
+        or ctx.get("confirmedOfferDate")
+        or ctx.get("selectedDate")
+    ):
+        return False
+    rows = _iter_date_tier_rows(ctx.get("availableDates") or [])
+    if len(rows) <= 1:
+        return False
+    if re.search(r"\b(CONFIRMED|DECLINE|TAG_)\b", reply, re.I):
+        return False
+    # Already offering the date list correctly
+    if re.search(
+        r"available\s+dates|उपलब्ध\s+तारीख|ಲಭ್ಯವಿರುವ\s+ದಿನಾಂಕ|or\s+reschedule|"
+        r"या\s+रीशेड्यूल|ಅಥವಾ\s+ಮರುನಿಗದಿ",
+        reply,
+        re.I,
+    ):
+        # If it also dumps many slots, still wrong — check slot density
+        slot_hits = len(
+            re.findall(
+                r"\b\d{1,2}(?::\d{2})?\s*(?:AM|PM|a\.m\.|p\.m\.)\b",
+                reply,
+                re.I,
+            )
+        )
+        if slot_hits < 4:
+            return False
+    has_slot_speech = bool(
+        re.search(
+            r"\b(?:AM|PM|a\.m\.|p\.m\.)\b|"
+            r"available\s+(?:time\s+)?slots?|"
+            r"please\s+choose\s+one|"
+            r"समय\s*स्लॉट|ಸಮಯ\s*ಸ್ಲಾಟ್",
+            reply,
+            re.I,
+        )
+    )
+    if not has_slot_speech:
+        return False
+    # Count how many payload dates appear in spoken form
+    date_mentions = 0
+    for row in rows:
+        d = row.get("date") or ""
+        spoken = format_date_for_speech(d, detect_locked_language(stream_sid))
+        if spoken and spoken.lower() in reply.lower():
+            date_mentions += 1
+            continue
+        # Day number + month name fallback
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", d):
+            day = int(d[8:10])
+            mo = int(d[5:7])
+            month = calendar.month_name[mo]
+            if re.search(rf"\b{day}(?:st|nd|rd|th)?\b.*\b{month}\b|\b{month}\b.*\b{day}\b", reply, re.I):
+                date_mentions += 1
+    # Slots without listing most of the dates = skipped date step
+    return date_mentions < min(2, len(rows))
+
+
 def should_force_step2_continuation(stream_sid: str, reply: str) -> bool:
-    """Hold-filler OR thanks-only after service tag — force Step 2 list."""
-    return is_incomplete_scheduling_filler(reply) or is_incomplete_service_tag_ack(
-        stream_sid, reply
+    """Hold-filler, thanks-only, or slots-before-date — force Step 2 list."""
+    return (
+        is_incomplete_scheduling_filler(reply)
+        or is_incomplete_service_tag_ack(stream_sid, reply)
+        or is_slots_offered_before_date(stream_sid, reply)
     )
 
 
 def build_deterministic_step2_after_tag(stream_sid: str) -> str:
-    """Fixed thanks + dates/slots from payload (no Nano)."""
+    """Fixed Great + dates/slots from payload (no Nano)."""
     ctx = call_context.get(stream_sid) or {}
     rows = _iter_date_tier_rows(ctx.get("availableDates") or [])
     lang = detect_locked_language(stream_sid)
@@ -1189,16 +1688,16 @@ def build_deterministic_step2_after_tag(stream_sid: str) -> str:
     if not rows:
         if lang == "hi":
             return (
-                "सर्विस टैग कन्फर्म करने के लिए धन्यवाद। अभी सिस्टम में कोई स्लॉट उपलब्ध नहीं है। "
+                "बहुत अच्छा। अभी सिस्टम में कोई स्लॉट उपलब्ध नहीं है। "
                 "हमारी टीम जल्द संपर्क करेगी।"
             )
         if lang == "kn":
             return (
-                "ಸರ್ವೀಸ್ ಟ್ಯಾಗ್ ದೃಢಪಡಿಸಿದ್ದಕ್ಕೆ ಧನ್ಯವಾದಗಳು. ಈಗ ಸಿಸ್ಟಂನಲ್ಲಿ ಸ್ಲಾಟ್ ಲಭ್ಯವಿಲ್ಲ. "
+                "ಚೆನ್ನಾಗಿದೆ. ಈಗ ಸಿಸ್ಟಂನಲ್ಲಿ ಸ್ಲಾಟ್ ಲಭ್ಯವಿಲ್ಲ. "
                 "ನಮ್ಮ ತಂಡ ಶೀಘ್ರದಲ್ಲೇ ಸಂಪರ್ಕಿಸುತ್ತದೆ."
             )
         return (
-            "Thanks for confirming the service tag. No appointment slots are available in the system right now. "
+            "Great. No appointment slots are available in the system right now. "
             "Our team will reach out soon."
         )
 
@@ -1215,17 +1714,16 @@ def build_deterministic_step2_after_tag(stream_sid: str) -> str:
         slots_line = ", ".join(spoken_slots) if spoken_slots else "the available times"
         if lang == "hi":
             return (
-                f"सर्विस टैग कन्फर्म करने के लिए धन्यवाद। {spoken_date} के लिए उपलब्ध समय स्लॉट हैं: "
+                f"बहुत अच्छा। {spoken_date} के लिए उपलब्ध समय स्लॉट हैं: "
                 f"{slots_line}। कृपया एक चुनें।"
             )
         if lang == "kn":
             return (
-                f"ಸರ್ವೀಸ್ ಟ್ಯಾಗ್ ದೃಢಪಡಿಸಿದ್ದಕ್ಕೆ ಧನ್ಯವಾದಗಳು. {spoken_date} ಗೆ ಲಭ್ಯವಿರುವ ಸಮಯ ಸ್ಲಾಟ್‌ಗಳು: "
+                f"ಚೆನ್ನಾಗಿದೆ. {spoken_date} ಗೆ ಲಭ್ಯವಿರುವ ಸಮಯ ಸ್ಲಾಟ್‌ಗಳು: "
                 f"{slots_line}. ದಯವಿಟ್ಟು ಒಂದನ್ನು ಆಯ್ಕೆ ಮಾಡಿ."
             )
         return (
-            f"Thanks for confirming the service tag. For {spoken_date}, the available time slots are: "
-            f"{slots_line}. Please choose one."
+            f"Great. Available slots are: {slots_line}. Please choose one."
         )
 
     spoken_dates = []
@@ -1235,34 +1733,33 @@ def build_deterministic_step2_after_tag(stream_sid: str) -> str:
             spoken_dates.append(format_date_for_speech(d, lang))
     dates_line = ", ".join(spoken_dates) if spoken_dates else "the available dates"
     if lang == "hi":
-        return (
-            f"सर्विस टैग कन्फर्म करने के लिए धन्यवाद। कृपया इनमें से एक तारीख चुनें: "
-            f"{dates_line}। या रीशेड्यूल।"
-        )
+        return f"बहुत अच्छा। उपलब्ध तारीखें हैं {dates_line} या रीशेड्यूल।"
     if lang == "kn":
-        return (
-            f"ಸರ್ವೀಸ್ ಟ್ಯಾಗ್ ದೃಢಪಡಿಸಿದ್ದಕ್ಕೆ ಧನ್ಯವಾದಗಳು. ದಯವಿಟ್ಟು ಈ ದಿನಾಂಕಗಳಿಂದ ಒಂದನ್ನು ಆಯ್ಕೆ ಮಾಡಿ: "
-            f"{dates_line}. ಅಥವಾ ಮರುನಿಗದಿ."
-        )
-    return (
-        f"Thanks for confirming the service tag. Please choose an appointment date from the following options: "
-        f"{dates_line}. Or reschedule."
-    )
+        return f"ಚೆನ್ನಾಗಿದೆ. ಲಭ್ಯವಿರುವ ದಿನಾಂಕಗಳು {dates_line} ಅಥವಾ ಮರುನಿಗದಿ."
+    return f"Great. Available dates are {dates_line} or reschedule."
 
 
 async def rewrite_incomplete_filler_reply(stream_sid: str, history: list, filler_reply: str) -> str:
-    """Force Step 2 (dates/slots) when Nano stalled or stopped after service-tag thanks."""
+    """Force Step 2 (dates/slots) when Nano stalled, stopped after thanks, or skipped dates."""
     logger.warning(
         "Incomplete Step-2 reply for stream %s — forcing date/slot list. Was: %r",
         stream_sid,
         filler_reply,
     )
-    # Prefer deterministic script immediately for thanks-only (most reliable)
-    if is_incomplete_service_tag_ack(stream_sid, filler_reply):
+    # Prefer deterministic script immediately for thanks-only / slots-before-date
+    if is_incomplete_service_tag_ack(stream_sid, filler_reply) or is_slots_offered_before_date(
+        stream_sid, filler_reply
+    ):
+        # Drop any slot chosen before a date was locked (multi-date skip)
+        if stream_sid in call_context and is_slots_offered_before_date(stream_sid, filler_reply):
+            call_context[stream_sid].pop("pendingSelectedSlot", None)
         reply = build_deterministic_step2_after_tag(stream_sid)
         history.append(AIMessage(content=filler_reply))
         history.append(AIMessage(content=reply))
-        logger.info("Used deterministic Step-2 after service-tag thanks stream=%s", stream_sid)
+        logger.info(
+            "Used deterministic Step-2 after incomplete/slots-before-date stream=%s",
+            stream_sid,
+        )
         return reply
 
     history.append(AIMessage(content=filler_reply))
@@ -1277,6 +1774,7 @@ async def rewrite_incomplete_filler_reply(stream_sid: str, history: list, filler
         not reply
         or is_incomplete_scheduling_filler(reply)
         or is_incomplete_service_tag_ack(stream_sid, reply)
+        or is_slots_offered_before_date(stream_sid, reply)
         or not reply_has_scheduling_content(reply)
     ):
         reply = build_deterministic_step2_after_tag(stream_sid)
@@ -1506,16 +2004,18 @@ def build_scheduling_calendar_prompt_parts(available_dates_obj: Any) -> tuple[st
         )
 
     mode = (
-        "MULTIPLE_DATE_MODE: After you thank the customer for confirming the service tag, in the SAME turn ask them to choose an appointment DATE. "
-        "List **every** date from the canonical list above in spoken form (month and day only, no year, in their locked language). "
-        "Immediately after listing those dates, also offer a **reschedule option** with the short line only "
-        "(English: \"Or reschedule.\" / Hindi: \"या रीशेड्यूल।\" / Kannada: \"ಅಥವಾ ಮರುನಿಗದಿ.\"). "
+        "MULTIPLE_DATE_MODE: After the customer confirms the service tag, in the SAME turn say a short "
+        "'Great.' (Hindi: 'बहुत अच्छा।' / Kannada: 'ಚೆನ್ನಾಗಿದೆ.') then immediately: "
+        "English: \"Available dates are [every date from the canonical list in spoken form, month and day only, no year] or reschedule.\" "
+        "Hindi: \"उपलब्ध तारीखें हैं [dates] या रीशेड्यूल।\" "
+        "Kannada: \"ಲಭ್ಯವಿರುವ ದಿನಾಂಕಗಳು [dates] ಅಥವಾ ಮರುನಿಗದಿ.\" "
+        "Do NOT say 'Thanks for confirming the service tag' or 'Please choose an appointment date from the following options'. "
         "Do NOT use the longer 'if none of these dates work' wording. "
         "Do NOT say please hold, please wait, let me check, or any stalling phrase — the dates are already in the system list. "
         "Do NOT read time slots until either (A) a listed date is chosen and confirmed, or (B) the customer chooses reschedule. "
         "Do NOT ask the customer to confirm the service address.\n"
         "PATH A — Pick a listed date: When they indicate one of the system dates, map to exactly one YYYY-MM-DD row. "
-        "Confirm with the SAME simple line in the locked language — English: \"You selected [spoken date — month and day only, no year]. Is that correct?\" "
+        "Confirm with the SAME simple line in the locked language — English: \"You chose [spoken date — month and day only, no year]. Correct?\" "
         "Hindi: \"आपने [spoken date] चुना है। क्या यह सही है?\" "
         "Kannada: \"ನೀವು [spoken date] ಆಯ್ಕೆ ಮಾಡಿದ್ದೀರಿ. ಇದು ಸರಿಯೇ?\" "
         "Only after clear YES, follow proximity-first "
@@ -1585,6 +2085,8 @@ def _parse_address_parts(address: str) -> List[str]:
 
 
 def _classify_address_part(part: str, *, is_first: bool) -> str:
+    if re.match(r"^state\s*:\s*", part, re.IGNORECASE):
+        return "skip"
     pin_match = _PINCODE_LABEL_RE.match(part)
     if pin_match:
         return "pincode"
@@ -1807,17 +2309,10 @@ Add a natural half-second pause at the end of each prompt before listening.
 ###################################### 2025 -07 -13 evening prompt ###############################################
 SYSTEM_PROMPT_TEMPLATE = """
 CORE DIRECTIVES
-OPENING AND LANGUAGE SELECTION:
-At the start of the conversation, speak Step 0a and Step 0b in English first, in order, before asking for language.
-Then ask the customer to select their preferred language from: English, Hindi, or Kannada.
-If the input is unclear, background noise, or not one of the supported languages, DO NOT auto-select.
-Politely ask the customer to repeat:
-👉 “I’m sorry, I didn’t catch that. Could you please say English, Hindi, or Kannada?”
-Once a supported language is clearly detected (e.g. the customer says “English”, “Hindi”, or “Kannada”), lock in that language immediately and proceed to Step 1 — do NOT ask “You selected [Language]. Is that correct?” or any other confirmation.
-Do not proceed to Step 1 until a supported language is clearly detected.
+{{opening_flow_instructions}}
 
 STRICTLY FORBIDDEN:
-NO MIXED LANGUAGES: After the customer's language is locked, reply ONLY in that language. If they clearly ask to switch (e.g. “English”, “switch to English”, “Hindi”, “Kannada”), switch immediately and continue the current step in the new language — do not restart the greeting. Never mix languages in one turn. For example, if English is locked, dates and confirms MUST be English only.
+NO MIXED LANGUAGES: After the customer's language is locked, reply ONLY in that language. If they clearly ask to switch to another language from {{language_options}}, switch immediately and continue the current step in the new language — do not restart the greeting. Never mix languages in one turn. For example, if English is locked, dates and confirms MUST be English only. Never offer or switch to a language that is not in {{language_options}}.
 NO INTERNAL DATA: Never speak or reference internal system commands, JSON data, sentiment scores, booking commands, numbers used for internal purposes, hangup commands, or tokens such as TAG_SERVICE_TAG_REJECT, TAG_ADDRESS_REJECT or TAG_RESCHEDULE_DONE.
 DO NOT READ BRACKETS: Never speak or read aloud any text inside curly braces {} or square brackets []. These are internal system placeholders or instructions, not part of the script to be spoken to the customer.
 NO FILLER / HOLD TURNS: Never say “please hold”, “please wait”, “hold on”, “one moment”, “let me check”, “checking the available dates/slots”, or any similar stalling line. You already have the canonical schedule below — speak it immediately in the same turn. Never end a turn without completing the required list (dates or slots).
@@ -1839,8 +2334,8 @@ Kannada: “ಜುಲೈ 13”
 Do **NOT** speak the year (never “two thousand twenty-six”, never “2026”). Do **NOT** ask the customer to confirm the year. Internally always map their choice back to the matching YYYY-MM-DD row (year is already known from the payload).
 
 LANGUAGE PHRASE ALIGNMENT (use these exact patterns after language lock):
-Date confirm — English: “You selected [date]. Is that correct?” | Hindi: “आपने [date] चुना है। क्या यह सही है?” | Kannada: “ನೀವು [date] ಆಯ್ಕೆ ಮಾಡಿದ್ದೀರಿ. ಇದು ಸರಿಯೇ?”
-Slot confirm — English: “You selected [time slot]. Is that correct?” | Hindi: “आपने [time slot] चुना है। क्या यह सही है?” | Kannada: “ನೀವು [time slot] ಆಯ್ಕೆ ಮಾಡಿದ್ದೀರಿ. ಇದು ಸರಿಯೇ?”
+Date confirm — English: “You chose [date]. Correct?” | Hindi: “आपने [date] चुना है। क्या यह सही है?” | Kannada: “ನೀವು [date] ಆಯ್ಕೆ ಮಾಡಿದ್ದೀರಿ. ಇದು ಸರಿಯೇ?”
+Slot confirm — English: “You chose [time slot]. Correct?” | Hindi: “आपने [time slot] चुना है। क्या यह सही है?” | Kannada: “ನೀವು [time slot] ಆಯ್ಕೆ ಮಾಡಿದ್ದೀರಿ. ಇದು ಸರಿಯೇ?”
 Booking goodbye — English: “Thank you for confirming your appointment. Bye” | Hindi: “अपॉइंटमेंट कन्फर्म करने के लिए धन्यवाद। बाय।” | Kannada: “ನಿಮ್ಮ ಅಪಾಯಿಂಟ್‌ಮೆಂಟ್ ದೃಢಪಡಿಸಿದ್ದಕ್ಕೆ ಧನ್ಯವಾದಗಳು. ಬೈ.” Then last line only: CONFIRMED (never speak CONFIRMED).
 Do not invent longer goodbye lines. Do not repeat date/time again on the final goodbye.
 
@@ -1858,20 +2353,8 @@ Canonical schedule from the system (never offer dates or slots that are not list
 {{available_dates_summary}}
 
 MANDATORY CONVERSATION FLOW
-Step 0 (OPENING — speak in this exact order before anything else)
-
-Step 0a (INTRO — always speak in English):
-👉 “Hello, I am calling from Dell Scheduling.
-This call is recorded for quality purposes”
-
-Step 0b (LANGUAGE SELECTION — after Step 0a):
-👉 “Please choose English, Hindi or Kannada.”
-If unclear/noise/invalid → repeat the language request only (do not repeat 0a unless the call restarted).
-Once a supported language is clearly detected → lock it in immediately and proceed to Step 1. Do NOT confirm with “You selected [Language]. Is that correct?”
-
-Step 1 (SERVICE TAG CONFIRMATION)
-Immediately after language is locked in, speak **in the customer’s selected language** using this structure:
-English: “Your service tag is: {{service_tag}}. Please confirm — is this correct?”
+{{step0_flow_instructions}}
+English: “Your service tag is: {{service_tag}}. Is this correct?”
 Hindi: “आपका सर्विस टैग है: {{service_tag}}. कृपया पुष्टि करें — क्या यह सही है?”
 Kannada: “ನಿಮ್ಮ ಸರ್ವೀಸ್ ಟ್ಯಾಗ್: {{service_tag}}. ದಯವಿಟ್ಟು ದೃಢಪಡಿಸಿ — ಇದು ಸರಿಯೇ?”
 Read the service tag **slowly and clearly** — pause briefly between characters, digits, and symbols (e.g. letters, numbers, dashes). Do not rush. Read {{service_tag}} exactly as provided; do not translate or change it regardless of the customer’s selected language.
@@ -1885,26 +2368,26 @@ Rules:
 If the customer says NO, wrong, incorrect, not correct, or clearly rejects the service tag → apologize briefly, say you cannot continue without the correct service tag, say our team will get back to them soon, say goodbye, and **end the conversation**. Do NOT ask for dates or times.
 If you must disconnect for a wrong service tag, put the exact token TAG_SERVICE_TAG_REJECT alone on the very last line of your response (system use only; do not speak this token aloud).
 If you receive a system notice that the service tag was rejected, follow it exactly: speak that closing apology and callback promise in the customer's language, then TAG_SERVICE_TAG_REJECT on the last line only.
-If the customer says YES, correct, right, or clearly confirms the service tag → in the **SAME turn**: (1) short thanks for confirming the service tag in the locked language
-(English: “Thanks for confirming the service tag.” / Hindi: “सर्विस टैग कन्फर्म करने के लिए धन्यवाद।” / Kannada: “ಸರ್ವೀಸ್ ಟ್ಯಾಗ್ ದೃಢಪಡಿಸಿದ್ದಕ್ಕೆ ಧನ್ಯವಾದಗಳು.”),
-then (2) immediately continue with Step 2 (list dates or slots per mode). Do **not** stop after thanks. Do **not** say please hold / please wait / let me check. Do **not** ask about the service address.
+If the customer says YES, correct, right, or clearly confirms the service tag → in the **SAME turn**: (1) say only
+(English: “Great.” / Hindi: “बहुत अच्छा।” / Kannada: “ಚೆನ್ನಾಗಿದೆ.”),
+then (2) immediately continue with Step 2 (list dates or slots per mode). Do **not** say “Thanks for confirming the service tag.” Do **not** stop after Great. Do **not** say please hold / please wait / let me check. Do **not** ask about the service address.
 If unclear or noise → ask them to repeat. Do not assume. Do not proceed until confirmation is clear.
 
 Step 2 (DATE AND TIME — obey {{scheduling_mode_instructions}})
 
 SINGLE_DATE_MODE:
-After confirming the Service Tag, in the **same turn**, go straight to time slots for the **only** date in the canonical list:
-English: “The available time slots are: [list **only** valid slots for that date in 12-hour AM/PM]. Please choose one.”
-Hindi: “उपलब्ध समय स्लॉट हैं: [list]. कृपया एक चुनें।”
-Kannada: “ಲಭ್ಯವಿರುವ ಸಮಯ ಸ್ಲಾಟ್‌ಗಳು: [list]. ದಯವಿಟ್ಟು ಒಂದನ್ನು ಆಯ್ಕೆ ಮಾಡಿ.”
+After confirming the Service Tag, in the **same turn**, say Great then go straight to time slots for the **only** date in the canonical list:
+English: “Great. Available slots are: [list **only** valid slots for that date in 12-hour AM/PM]. Please choose one.”
+Hindi: “बहुत अच्छा। उपलब्ध समय स्लॉट हैं: [list]. कृपया एक चुनें।”
+Kannada: “ಚೆನ್ನಾಗಿದೆ. ಲಭ್ಯವಿರುವ ಸಮಯ ಸ್ಲಾಟ್‌ಗಳು: [list]. ದಯವಿಟ್ಟು ಒಂದನ್ನು ಆಯ್ಕೆ ಮಾಡಿ.”
 If unclear → ask them to repeat. Do not auto-select a slot. After they choose, confirm with LANGUAGE PHRASE ALIGNMENT slot confirm. Only after YES → continue toward Step 4.
 
 MULTIPLE_DATE_MODE:
-2a — After confirming the Service Tag, in the **same turn**, ask them to choose a date, **list every date** from the canonical list in spoken form in their locked language (no year), then offer reschedule with the short line only:
-English: “Or reschedule.”
-Hindi: “या रीशेड्यूल।”
-Kannada: “ಅಥವಾ ಮರುನಿಗದಿ.”
-Do NOT use longer wording like “if none of these dates work”. Do not read time slots yet. Never say please hold / please wait.
+2a — After confirming the Service Tag, in the **same turn**, say Great then list dates with this exact short pattern (month and day only, no year):
+English: “Great. Available dates are [date1], [date2] or reschedule.”
+Hindi: “बहुत अच्छा। उपलब्ध तारीखें हैं [date1], [date2] या रीशेड्यूल।”
+Kannada: “ಚೆನ್ನಾಗಿದೆ. ಲಭ್ಯವಿರುವ ದಿನಾಂಕಗಳು [date1], [date2] ಅಥವಾ ಮರುನಿಗದಿ.”
+Do NOT say “Please choose an appointment date from the following options” or “Thanks for confirming the service tag”. Do NOT use longer wording like “if none of these dates work”. Do not read time slots yet. Never say please hold / please wait.
 2b — **Pick a listed date:** match their choice to one YYYY-MM-DD row. Confirm with LANGUAGE PHRASE ALIGNMENT date confirm. Only after clear YES continue.
    If they only say yes/correct/ok **without naming a date** right after you listed dates, ask which date they want — do **not** treat that as reschedule and do **not** re-ask the service tag.
 2c — In the **same turn** after date YES, offer **all** slots for that confirmed date (never say “please wait”). Confirm slot with LANGUAGE PHRASE ALIGNMENT slot confirm before proceeding.
@@ -1932,7 +2415,7 @@ You MUST NOT proceed to Step 4 until:
 1. Confirmed service tag from Step 1.
 2. MULTIPLE_DATE_MODE: customer has **confirmed with YES** which appointment date (one YYYY-MM-DD from the list) before slots were offered for that date.
 3. SINGLE_DATE_MODE: the single system date is the appointment date for slot selection.
-4. A clear **YES** for the chosen **time slot** after you asked “Is that correct?” for the slot.
+4. A clear **YES** for the chosen **time slot** after you asked “Correct?” for the slot.
 
 Formatting Rule for Step 3:
 [Spoken Date] = the appointment date being booked (the only date in SINGLE_DATE_MODE, or the date the customer confirmed in MULTIPLE_DATE_MODE). Say it as **Month Day only** (no year) in their language.
@@ -1965,7 +2448,7 @@ ABSOLUTE RULES
 Do NOT accept or process any input while you are speaking. Always finish your full prompt first.
 Ignore background noise while speaking.
 Always confirm service tag, date, and time before finalizing. Do NOT ask for address confirmation.
-Never cut your prompt short. Always complete full sentences — especially after service-tag thanks, immediately list dates/slots.
+Never cut your prompt short. Always complete full sentences — especially after “Great.”, immediately list dates/slots.
 Add a natural half-second pause at the end of each prompt before listening.
 """
 
@@ -2210,11 +2693,21 @@ def build_system_message_for_stream(stream_sid: str) -> str:
         available_dates_obj
     )
     service_tag_str = (context.get("serviceTag") or "").strip() or "Not provided."
+    lang_opts = language_offer_phrase(get_allowed_languages(stream_sid))
+    if skip_language_selection(stream_sid):
+        opening = _OPENING_FLOW_TAMIL_NADU
+        step0 = _STEP0_FLOW_TAMIL_NADU
+    else:
+        opening = _OPENING_FLOW_NORMAL
+        step0 = _STEP0_FLOW_NORMAL
     return (
         SYSTEM_PROMPT_TEMPLATE.replace("{{ticket_id}}", ticket_id)
         .replace("{{service_tag}}", service_tag_str)
         .replace("{{scheduling_mode_instructions}}", mode_instructions)
         .replace("{{available_dates_summary}}", dates_summary)
+        .replace("{{opening_flow_instructions}}", opening)
+        .replace("{{step0_flow_instructions}}", step0)
+        .replace("{{language_options}}", lang_opts)
     )
 
 
@@ -2317,7 +2810,7 @@ async def connect_to_openai(stream_sid: str, person_name: str) -> websockets.Web
                 "role": "user",
                 "content": [{
                     "type": "input_text",
-                    "text": "(The phone call has just connected. Begin immediately with Step 0a, then Step 0b, then Step 0c from the script. Do not wait for the customer to speak first. Do not skip any opening step.)"
+                    "text": greeting_user_prompt_for_stream(stream_sid),
                 }]
             }
         }))
@@ -2561,8 +3054,19 @@ async def handle_ai_commands(stream_sid: str, message: str):
             stream_sid,
             (call_context[stream_sid].get("last_assistant_message") or "") + "\n" + normalized_msg,
         )
+        maybe_infer_pending_date_from_slot(stream_sid)
         _force_booking_fields_from_context(stream_sid, normalized_msg)
         ctx = call_context[stream_sid]
+        if not (
+            ctx.get("pendingSelectedDate")
+            or ctx.get("confirmedOfferDate")
+            or ctx.get("selectedDate")
+        ):
+            logger.warning(
+                "Skipping CONFIRMED hangup stream=%s — no mapped date yet",
+                stream_sid,
+            )
+            return
         if not (ctx.get("pendingSelectedSlot") or ctx.get("selectedSlot")):
             logger.warning(
                 "Skipping CONFIRMED hangup stream=%s — no mapped slot yet",

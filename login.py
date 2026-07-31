@@ -24,8 +24,8 @@ app = FastAPI(title="Schedule API")
 
 
 # PUBLIC_WS_BASE = "https://fieldez-hjbzfyhjb6dsdsdw.centralindia-01.azurewebsites.net"
-# PUBLIC_WS_BASE = "https://fieldeztata-poc-a4abeebch0h2hrcz.centralindia-01.azurewebsites.net"
-PUBLIC_WS_BASE = "https://jameson-nondiscriminative-zaiden.ngrok-free.dev"
+PUBLIC_WS_BASE = "https://fieldeztata-poc-a4abeebch0h2hrcz.centralindia-01.azurewebsites.net"
+# PUBLIC_WS_BASE = "https://jameson-nondiscriminative-zaiden.ngrok-free.dev"
 
 
 
@@ -70,7 +70,7 @@ async def initiate_schedule_call(payload: ScheduleCallRequest):
                 "callbackUrl": str(payload.callbackUrl),
                 "serviceTag": str(payload.serviceTag).strip(),
                 "serviceTagConfirmed": None,
-                "address": summarize_address_for_speech(payload.address),
+                **build_language_fields_from_address(payload.address),
                 "pincode": getattr(payload, "pincode", None),
                 "availableDates": payload.availableDates,
                 "callConnected": True,
@@ -90,7 +90,16 @@ async def initiate_schedule_call(payload: ScheduleCallRequest):
             }
             call_context[call_sid] = ctx
             call_context[f"ticket:{str(payload.ticketId).strip()}"] = ctx
- 
+
+            logger.info(
+                "Call initiated CallSid=%s ticketId=%s state=%s allowedLanguages=%s skipLanguageSelection=%s",
+                call_sid,
+                payload.ticketId,
+                ctx.get("ticketState"),
+                ctx.get("allowedLanguages"),
+                ctx.get("skipLanguageSelection"),
+            )
+
             return JSONResponse(status_code=resp.status_code, content={"result": call_details, "status": "success"})
     except Exception as e:
         logger.error(f"Error starting call: {e}", exc_info=True)
@@ -111,7 +120,7 @@ async def prepare_inbound_call(payload: PrepareInboundCallRequest):
         "callbackUrl": str(payload.callbackUrl),
         "serviceTag": str(getattr(payload, "serviceTag", "") or "").strip(),
         "serviceTagConfirmed": None,
-        "address": summarize_address_for_speech(payload.address),
+        **build_language_fields_from_address(payload.address),
         "pincode": getattr(payload, "pincode", None),
         "availableDates": payload.availableDates,
         "callConnected": True,
