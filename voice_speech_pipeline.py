@@ -173,6 +173,74 @@ def _disable_listening(stream_sid: str) -> None:
     sess["listening_enabled"] = False
 
 
+async def pause_recognition(stream_sid: str) -> None:
+    """Stop Azure continuous recognition to avoid STT billing while the bot speaks."""
+    sess = speech_sessions.get(stream_sid)
+    if not sess or sess.get("closed"):
+        return
+    lock = sess.get("recognition_lock")
+    if lock is None:
+        return
+    async with lock:
+        if not sess.get("recognition_running"):
+            return
+        recognizer = sess.get("recognizer")
+        if not recognizer:
+            sess["recognition_running"] = False
+            return
+        try:
+            await asyncio.to_thread(
+                recognizer.stop_continuous_recognition_async().get
+            )
+            sess["recognition_running"] = False
+            logger.info("Speech recognition paused stream=%s", stream_sid)
+        except Exception as e:
+            sess["recognition_running"] = False
+            logger.warning("Failed to pause recognition for %s: %s", stream_sid, e)
+
+
+async def resume_recognition(stream_sid: str) -> None:
+    """Start/resume Azure continuous recognition for the next listen window."""
+    sess = speech_sessions.get(stream_sid)
+    if not sess or sess.get("closed"):
+        return
+    ctx = _svc.call_context.get(stream_sid) or {}
+    if ctx.get("pending_hangup") or ctx.get("status") == "closing":
+        return
+    lock = sess.get("recognition_lock")
+    if lock is None:
+        return
+    async with lock:
+        # Re-check after awaiting the lock — session may have closed or another
+        # coroutine may have already started recognition.
+        if sess.get("closed") or sess.get("recognition_running"):
+            return
+        ctx = _svc.call_context.get(stream_sid) or {}
+        if ctx.get("pending_hangup") or ctx.get("status") == "closing":
+            return
+        recognizer = sess.get("recognizer")
+        if not recognizer:
+            return
+        try:
+            await asyncio.to_thread(
+                recognizer.start_continuous_recognition_async().get
+            )
+            sess["recognition_running"] = True
+            logger.info("Speech recognition resumed stream=%s", stream_sid)
+        except Exception as e:
+            logger.warning("Failed to resume recognition for %s: %s", stream_sid, e)
+
+
+async def _arm_listening(
+    stream_sid: str, *, schedule_silence_after: bool = True
+) -> None:
+    """Ensure STT is running, then open the application listen gate."""
+    await resume_recognition(stream_sid)
+    _enable_listening(stream_sid)
+    if schedule_silence_after:
+        schedule_listening_silence_watchdog(stream_sid)
+
+
 def schedule_listening_silence_watchdog(stream_sid: str) -> None:
     """Start 5s nudge / 15s hangup timers after bot finishes speaking."""
     sess = speech_sessions.get(stream_sid)
@@ -219,8 +287,13 @@ async def _speak_direct(
         return
     gen = int(sess.get("tts_gen", 0))
     await _wait_tts_gen_playback(stream_sid, gen)
-    # Ensure listen window is open after a silence-owned speak
+    # Ensure listen window is open after a silence-owned speak (nudge).
+    # Hangup / closing paths must leave STT stopped.
     if not schedule_silence_after:
+        ctx = _svc.call_context.get(stream_sid) or {}
+        if ctx.get("pending_hangup") or ctx.get("status") == "closing":
+            return
+        await resume_recognition(stream_sid)
         _enable_listening(stream_sid)
 
 
@@ -453,6 +526,9 @@ async def start_speech_session(stream_sid: str, system_message: str) -> None:
         "loop": loop,
         "bot_speaking": False,
         "listening_enabled": False,
+        # STT starts only after the greeting finishes (see resume_recognition).
+        "recognition_running": False,
+        "recognition_lock": asyncio.Lock(),
         "tts_gen": 0,
         "silence_gen": 0,
         "listen_started_at": 0.0,
@@ -497,13 +573,20 @@ async def start_speech_session(stream_sid: str, system_message: str) -> None:
             stream_sid,
             evt,
         )
+        sess = speech_sessions.get(stream_sid)
+        if sess:
+            sess["recognition_running"] = False
 
     recognizer.recognizing.connect(on_recognizing)
     recognizer.recognized.connect(on_recognized)
     recognizer.canceled.connect(on_canceled)
-    recognizer.start_continuous_recognition_async()
+    # Do not start continuous recognition here — wait until greeting playback
+    # finishes so Azure is not billed during the opening TTS.
 
-    logger.info("Speech session started for stream %s — triggering greeting", stream_sid)
+    logger.info(
+        "Speech session started for stream %s — triggering greeting (STT deferred)",
+        stream_sid,
+    )
     # Do not await: keep Exotel WS receive loop free while Nano+TTS run.
     greeting = _svc.greeting_user_prompt_for_stream(stream_sid)
     asyncio.create_task(inject_and_respond(stream_sid, greeting))
@@ -512,6 +595,11 @@ async def start_speech_session(stream_sid: str, system_message: str) -> None:
 async def feed_pcm_audio(stream_sid: str, pcm_bytes: bytes) -> None:
     sess = speech_sessions.get(stream_sid)
     if not sess or sess.get("closed"):
+        return
+    # Only push PCM while Azure recognition is armed — avoids STT cost during
+    # greeting / bot TTS. Keep feeding during Nano think time (listening off
+    # but recognition still running) so early speech can mark activity.
+    if not sess.get("recognition_running"):
         return
     try:
         sess["push_stream"].write(pcm_bytes)
@@ -588,8 +676,7 @@ async def inject_and_respond(stream_sid: str, user_text: str) -> None:
             if speakable:
                 await _synthesize_and_queue(stream_sid, speakable)
             else:
-                _enable_listening(stream_sid)
-                schedule_listening_silence_watchdog(stream_sid)
+                await _arm_listening(stream_sid)
             return
 
         sess["history"].append(HumanMessage(content=user_text))
@@ -637,8 +724,7 @@ async def inject_and_respond(stream_sid: str, user_text: str) -> None:
         if speakable:
             await _synthesize_and_queue(stream_sid, speakable)
         else:
-            _enable_listening(stream_sid)
-            schedule_listening_silence_watchdog(stream_sid)
+            await _arm_listening(stream_sid)
 
         await _svc.handle_ai_commands(stream_sid, reply)
 
@@ -657,6 +743,8 @@ async def _synthesize_and_queue(
     if cancel_silence:
         _cancel_silence_watchdog(stream_sid)
     _disable_listening(stream_sid)
+    # Stop Azure STT before TTS so bot audio / silence is not billed.
+    await pause_recognition(stream_sid)
 
     voice = _pick_tts_voice(stream_sid, text)
     gen = int(sess.get("tts_gen", 0)) + 1
@@ -701,9 +789,7 @@ async def _synthesize_and_queue(
         if ev:
             ev.set()
         _svc.response_audio_tracking.pop(stream_sid, None)
-        _enable_listening(stream_sid)
-        if schedule_silence_after:
-            schedule_listening_silence_watchdog(stream_sid)
+        await _arm_listening(stream_sid, schedule_silence_after=schedule_silence_after)
         return
 
     sess = speech_sessions.get(stream_sid)
@@ -763,15 +849,15 @@ async def _synthesize_and_queue(
         ):
             sess2["listening_enabled"] = False
             sess2["bot_speaking"] = False
+            # Keep Azure STT stopped — no further customer turns expected.
+            await pause_recognition(stream_sid)
             logger.info(
                 "Playback done — listen stays closed stream=%s gen=%s",
                 stream_sid,
                 gen,
             )
             return
-        _enable_listening(stream_sid)
-        if schedule_silence_after:
-            schedule_listening_silence_watchdog(stream_sid)
+        await _arm_listening(stream_sid, schedule_silence_after=schedule_silence_after)
         logger.info(
             "Playback done — listening open stream=%s audio=%.1fs wait=%.1fs silence_after=%s",
             stream_sid,
@@ -792,9 +878,13 @@ async def stop_speech_session(stream_sid: str) -> None:
     sess["tts_gen"] = int(sess.get("tts_gen", 0)) + 1
     try:
         recognizer = sess.get("recognizer")
-        if recognizer:
-            recognizer.stop_continuous_recognition_async()
+        if recognizer and sess.get("recognition_running"):
+            await asyncio.to_thread(
+                recognizer.stop_continuous_recognition_async().get
+            )
+        sess["recognition_running"] = False
     except Exception as e:
+        sess["recognition_running"] = False
         logger.warning("Error stopping Speech recognizer for %s: %s", stream_sid, e)
     try:
         push = sess.get("push_stream")
